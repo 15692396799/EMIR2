@@ -24,6 +24,10 @@ runs_smoke/
 *.out
 *.err
 
+# Experiment run artifacts (answers, scores, per-persona memory stores)
+Experiment/runs/
+Experiment/.env
+
 # Editors and OS
 .vscode/
 .idea/

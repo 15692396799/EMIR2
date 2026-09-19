@@ -9,10 +9,14 @@ system on the **MemConflict** benchmark.
 | --- | --- |
 | `Retrival-Mem/` | Memory system under test (V4 backend, multi-round retrieval). |
 | `MemConflict/` | Conflict benchmark, released data, and the evaluation harness. |
-| `MemConflict/Evaluation/eval_retrival_mem.py` | Retrival-Mem runner: replays the session chain, ingestion + retrieval + answering. |
-| `MemConflict/Evaluation/scoring_retrival_mem.py` | Scoring entry point (delegates to `eval_scoring.py`). |
+| `Experiment/` | EMIR² conflict-test experiment. Owns the runner, the MemConflict prompts, the judge and the Table 3 metrics. |
 | `doc_by_human/` | Task notes and the `Step4_4.jsonl` data-structure analysis. |
 | `doc_by_human/Step4_4_record1_analysis.md` | Field-by-field breakdown of the first record of the benchmark data. |
+
+`Retrival-Mem/` and `MemConflict/` are kept byte-identical to their upstream
+commits and are treated as read-only dependencies: all experiment-specific code
+lives in `Experiment/`. See [Experiment/README.md](Experiment/README.md) for the
+LoCoMo-to-MemConflict adaptation and the run commands.
 
 ## Upstream sources
 

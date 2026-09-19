@@ -135,6 +135,61 @@ def score_persona(
     return scored_persona, flat
 
 
+def load_personas_from_results(path: Path) -> list[dict[str, Any]]:
+    """Load persona records written by ``run_experiment.py``."""
+    personas: list[dict[str, Any]] = []
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                personas.append(json.loads(line))
+    return personas
+
+
+def rebuild_personas_from_sessions(path: Path) -> list[dict[str, Any]]:
+    """Reconstruct persona records from the per-session progress log.
+
+    ``run_experiment.py`` appends one line per completed session, so a run that
+    was killed before finishing a persona can still be scored instead of being
+    thrown away.
+    """
+    grouped: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            persona_id = str(row.get("Persona_ID") or "")
+            persona = grouped.get(persona_id)
+            if persona is None:
+                persona = {
+                    "Persona_ID": persona_id,
+                    "Memory_System": row.get("Memory_System"),
+                    "Sessions": [],
+                    "Rebuilt_From_Sessions_JSONL": True,
+                }
+                grouped[persona_id] = persona
+                order.append(persona_id)
+            persona["Sessions"].append(
+                {
+                    "Session_ID": row.get("Session_ID"),
+                    "Date": row.get("Date"),
+                    "Session_Type": row.get("Session_Type"),
+                    "Question_Trigger_Types": row.get("Question_Trigger_Types") or [],
+                    "Event_Types": row.get("Event_Types") or [],
+                    "Ingest": row.get("Ingest") or {},
+                    "Questions": row.get("Questions") or [],
+                }
+            )
+    for persona in grouped.values():
+        persona["Answered_Question_Count"] = sum(
+            len(session.get("Questions") or []) for session in persona["Sessions"]
+        )
+    return [grouped[persona_id] for persona_id in order]
+
+
 def main(argv: list[str] | None = None) -> int:
     runtime.ensure_utf8_console()
     args = build_arg_parser().parse_args(argv)
@@ -146,12 +201,15 @@ def main(argv: list[str] | None = None) -> int:
     output_dir = args.output_dir or (run_dir if run_dir else results_path.parent)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    personas = []
-    with open(results_path, encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if line:
-                personas.append(json.loads(line))
+    personas = load_personas_from_results(results_path)
+    if not personas:
+        sessions_path = results_path.parent / "sessions.jsonl"
+        if sessions_path.is_file():
+            personas = rebuild_personas_from_sessions(sessions_path)
+            print(
+                f"[warn] results.jsonl is empty; rebuilt {len(personas)} persona(s) "
+                f"from {sessions_path.name} (run was interrupted before a persona finished)"
+            )
     if not personas:
         print("[error] no persona records found", file=sys.stderr)
         return 2

@@ -21,6 +21,7 @@ from typing import Any, Sequence
 
 from . import runtime
 from .data import Persona, Session
+from .embedding import wrap_embedding_client
 
 
 @dataclass(frozen=True)
@@ -153,10 +154,16 @@ class MemConflictMemory:
             str(self.store_dir / "faiss"),
         )
         self.config = config
+        embedding_client = wrap_embedding_client(
+            client.make_embedding_client(config.embedding, resilient=False),
+            config.embedding.provider,
+        )
         self.system = client.MemorySystem(
             config,
+            embedding_client=embedding_client,
             api_history_logger=client.ApiHistoryLogger(str(self.store_dir)),
         )
+        self.embedding_client = embedding_client
 
     @staticmethod
     def build_namespace(persona: Persona, version: str) -> str:

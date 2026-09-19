@@ -31,8 +31,16 @@ class DialogueTurn:
     session_date: str
 
     def to_memory_turn(self) -> dict[str, Any]:
+        """Turn payload for the V4 builder.
+
+        ``turn_id`` must be a *string*. With a bare JSON number the builder
+        model tends to invent a prefix (``"turn_33"``), which then fails the
+        builder's evidence-id validation because ``turn_33`` is not a supplied
+        id. A self-describing string is copied verbatim, which is also what the
+        upstream LoCoMo path does (it uses ``dia_id`` strings such as ``D1:1``).
+        """
         return {
-            "turn_id": self.turn_id,
+            "turn_id": f"turn_{self.turn_id}",
             "role": self.role,
             "speaker": self.role,
             "content": self.content,

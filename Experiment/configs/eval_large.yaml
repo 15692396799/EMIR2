@@ -1,0 +1,115 @@
+﻿# Point 11/13: large-model config for the real Table 3 scores.
+#
+# Role split (documented so the run is reproducible):
+#   * embedding / controller / window_planner / entity_judge / decomposition_gate
+#     / slm -> the GPU server's Ollama, with exactly the models upstream
+#     `default.yaml` specifies (qwen3-embedding, qwen3.5:latest). No substitution.
+#   * memory_builder / adjudication / answer_model -> OpenRouter z-ai/glm-5.1.
+#     These are the roles whose quality drives AA and SEH@3, and they are the
+#     "large model" of point 13.
+#   * judge_model -> OpenRouter openai/gpt-4o-mini, matching the MemConflict
+#     protocol (point 10).
+#
+# Reach the Ollama roles through the SSH tunnel first:
+#   ssh -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa \
+#       -N -L 41135:127.0.0.1:41135 tx@172.26.4.254
+#
+#   python Experiment/run_experiment.py --config Experiment/configs/eval_large.yaml
+#
+# Requires DASHSCOPE_API_KEY, DASHSCOPE_CHAT_COMPLETIONS_ENDPOINT,
+# DASHSCOPE_EMBEDDINGS_ENDPOINT, OPENROUTER_API_KEY and
+# OPENROUTER_CHAT_COMPLETIONS_ENDPOINT in Experiment/.env.
+
+experiment:
+  track: evaluation
+models:
+  embedding:
+    provider: ollama
+    model: qwen3-embedding
+    base_url_env: OLLAMA_BASE_URL
+    timeout: 600
+  memory_builder: &large_chat
+    provider: openrouter
+    model: z-ai/glm-5.1
+    api_key_env: OPENROUTER_API_KEY
+    chat_completions_endpoint_env: OPENROUTER_CHAT_COMPLETIONS_ENDPOINT
+    temperature: 0.0
+    timeout: 300
+    extra_body:
+      max_tokens: 32768
+  adjudication_model: *large_chat
+  answer_model: *large_chat
+  judge_model:
+    provider: openrouter
+    model: openai/gpt-4o-mini
+    api_key_env: OPENROUTER_API_KEY
+    chat_completions_endpoint_env: OPENROUTER_CHAT_COMPLETIONS_ENDPOINT
+    temperature: 0.0
+    timeout: 120
+    extra_body:
+      max_tokens: 512
+  window_planner: &control_chat
+    provider: ollama
+    model: qwen3.5:latest
+    base_url_env: OLLAMA_BASE_URL
+    temperature: 0.0
+    timeout: 3600
+  entity_judge: *control_chat
+  controller: *control_chat
+  decomposition_gate: *control_chat
+  slm: *control_chat
+memory:
+  backend: v4
+  memory_extraction_batch_turns: 64
+  memory_extraction_workers: 8
+  llm_max_retries: 2
+  llm_retry_backoff_seconds: 1.0
+  include_retrieval_trace_in_answer_prompt: false
+  answer_context_mode: content aware
+  backends:
+    v4:
+      database_path: data/memconflict_eval.sqlite3
+      faiss_path: data/memconflict_eval_faiss
+      memory_builder_model: memory_builder
+      semantic_state_model: null
+      embedding_model: embedding
+      entity_judge_batch_size: 8
+      entity_judge_workers: 2
+      entity_auto_merge_policy: conservative
+      # See smoke_small.yaml: the upstream 8192 default is sized for LoCoMo and
+      # truncates MemConflict extractions.
+      prompt_output_tokens:
+        memory_builder: 32768
+        semantic_reducer: 8192
+        window_boundary: 512
+        entity_judge: 2048
+        cross_window_adjudication: 4096
+      window_planner:
+        mode: model
+        token_encoding: cl100k_base
+        min_builder_input_tokens: 2048
+        target_builder_input_tokens: 12000
+        max_builder_input_tokens: 30000
+        max_window_turns: 0
+        max_window_atoms: 64
+retrieval:
+  strategy: multi_round
+  controller_profile: teacher
+  strategies:
+    multi_round:
+      controller_model: controller
+      controller_max_retries: 2
+      rank_fusion_constant: 60
+      model_evidence_filter_enabled: false
+evaluation:
+  benchmarks:
+  - locomo
+  benchmark_dir: benchmark
+  output_dir: runs
+  locomo:
+    answer_workers: 4
+    answer_chunk_size: 1
+    judge_workers: 4
+    answer_max_retries: 2
+    use_llm_judge: true
+

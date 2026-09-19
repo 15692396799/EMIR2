@@ -82,7 +82,10 @@ def import_retrival_mem(root: Path | None = None):
 
     from api_history import ApiHistoryLogger  # type: ignore[import-not-found]
     from memory import MemorySystem  # type: ignore[import-not-found]
-    from memory.clients import make_chat_client  # type: ignore[import-not-found]
+    from memory.clients import (  # type: ignore[import-not-found]
+        make_chat_client,
+        make_embedding_client,
+    )
     from memory.config import (  # type: ignore[import-not-found]
         configure_backend_output_paths,
         load_config,
@@ -91,6 +94,7 @@ def import_retrival_mem(root: Path | None = None):
     return SimpleNamespace(
         MemorySystem=MemorySystem,
         make_chat_client=make_chat_client,
+        make_embedding_client=make_embedding_client,
         load_config=load_config,
         configure_backend_output_paths=configure_backend_output_paths,
         ApiHistoryLogger=ApiHistoryLogger,
@@ -154,7 +158,10 @@ def required_env_names(config, roles: tuple[str, ...] = RUNNER_ROLES) -> list[st
         prefix = _PROVIDER_PREFIX.get(provider)
         if prefix:
             required.add(f"{prefix}_API_KEY")
-            required.add(f"{prefix}_CHAT_COMPLETIONS_ENDPOINT")
+            if role == "embedding":
+                required.add(f"{prefix}_EMBEDDINGS_ENDPOINT")
+            else:
+                required.add(f"{prefix}_CHAT_COMPLETIONS_ENDPOINT")
     return sorted(required)
 
 

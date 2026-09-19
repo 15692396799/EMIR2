@@ -37,6 +37,12 @@ from memconflict_eval.judging import (  # noqa: E402
     _coerce_rank,
 )
 from memconflict_eval.memory import MemConflictMemory, RetrievedMemory, store_dir_for  # noqa: E402
+from memconflict_eval.embedding import (  # noqa: E402
+    BatchedEmbeddingClient,
+    _is_transient,
+    embed_batch_limit,
+    wrap_embedding_client,
+)
 from memconflict_eval.metrics import (  # noqa: E402
     aggregate,
     render_detail_table,
@@ -90,6 +96,19 @@ class DialogueOrderingTests(unittest.TestCase):
         self.assertEqual(payload["timestamp"], "2024-05-06")
         self.assertEqual(payload["session_timestamp"], "2024-05-06")
         self.assertEqual(payload["role"], "user")
+
+    def test_memory_turn_id_is_a_string(self):
+        """A numeric turn_id makes the builder model invent a prefix.
+
+        The extracted ``evidence_turn_ids`` are validated against the supplied
+        ids, so emitting ``33`` instead of ``"turn_33"`` makes every extracted
+        item unrepairable. Keep this a string.
+        """
+        dialogue = {"dialogue_turn_1": [{"role": "user", "content": "x"}]}
+        payload = flatten_session_dialogue(dialogue, "2024-05-06")[0].to_memory_turn()
+        self.assertIsInstance(payload["turn_id"], str)
+        self.assertEqual(payload["turn_id"], "turn_1")
+        self.assertFalse(payload["turn_id"].isdigit())
 
     def test_unsupported_dialogue_shapes_are_empty(self):
         self.assertEqual(flatten_session_dialogue(None, "2022-01-03"), ())
@@ -487,15 +506,21 @@ class _FakeChatClient:
 
 
 def _patch_runtime(fake_system, answer_client, judge_client):
+    class _FakeEmbeddingClient:
+        def embed_texts(self, texts):
+            return [[0.0] for _ in texts]
+
     runtime.import_retrival_mem = lambda root=None: SimpleNamespace(
-        MemorySystem=lambda config, api_history_logger=None: fake_system,
+        MemorySystem=lambda config, api_history_logger=None, embedding_client=None: fake_system,
         ApiHistoryLogger=lambda _path: None,
         configure_backend_output_paths=lambda *_a, **_k: None,
+        make_embedding_client=lambda model_config, resilient=False: _FakeEmbeddingClient(),
         make_chat_client=lambda model_config: (
             judge_client if getattr(model_config, "role", "") == "judge" else answer_client
         ),
     )
     runtime.load_memory_config = lambda config_path=None: SimpleNamespace(
+        embedding=SimpleNamespace(provider="ollama", model="fake-embed"),
         answer_model=SimpleNamespace(role="answer", model="fake-answer"),
         judge_model=SimpleNamespace(role="judge", model="fake-judge"),
     )
@@ -655,6 +680,74 @@ class EndToEndOrderingTests(unittest.TestCase):
         system_message = answer_client.calls[0]["messages"][0]["content"]
         self.assertEqual(system_message, ANSWER_SYSTEM_PROMPTS["dynamic_conflict"])
 
+    def test_every_completed_session_is_reported_incrementally(self):
+        """A persona that dies part-way must not lose its finished sessions."""
+        from run_experiment import run_persona
+
+        fake_system = _FakeMemorySystem()
+        _patch_runtime(fake_system, _FakeChatClient("ans"), _FakeChatClient())
+        rows = []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_persona(
+                persona=self._persona(),
+                output_dir=Path(tmp),
+                config_path=Path("unused.yaml"),
+                answerer=MemConflictAnswerer(),
+                top_k=2,
+                stored_top_k=5,
+                version="v1",
+                keep_memory=False,
+                on_session=rows.append,
+            )
+
+        self.assertEqual([row["Session_ID"] for row in rows], [0, 1])
+        self.assertEqual(rows[0]["Questions"], [])
+        self.assertEqual(len(rows[1]["Questions"]), 1)
+        self.assertEqual(rows[1]["Questions"][0]["Model_Answer"], "ans")
+
+
+class SessionFallbackTests(unittest.TestCase):
+    """Scoring must survive a run that never finished a persona."""
+
+    def test_personas_are_rebuilt_from_the_session_log(self):
+        from run_scoring import rebuild_personas_from_sessions
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sessions.jsonl"
+            rows = [
+                {
+                    "Persona_ID": "p1",
+                    "Memory_System": "retrival_mem_v4",
+                    "Session_ID": 0,
+                    "Date": "2022-01-03",
+                    "Questions": [],
+                },
+                {
+                    "Persona_ID": "p1",
+                    "Session_ID": 5,
+                    "Date": "2022-02-25",
+                    "Questions": [{"question_id": "Q_001"}],
+                },
+                {
+                    "Persona_ID": "p2",
+                    "Session_ID": 0,
+                    "Date": "2022-03-01",
+                    "Questions": [{"question_id": "Q_001"}, {"question_id": "Q_002"}],
+                },
+            ]
+            with open(path, "w", encoding="utf-8") as handle:
+                for row in rows:
+                    handle.write(json.dumps(row) + "\n")
+
+            personas = rebuild_personas_from_sessions(path)
+
+        self.assertEqual([p["Persona_ID"] for p in personas], ["p1", "p2"])
+        self.assertEqual(len(personas[0]["Sessions"]), 2)
+        self.assertEqual(personas[0]["Answered_Question_Count"], 1)
+        self.assertEqual(personas[1]["Answered_Question_Count"], 2)
+        self.assertTrue(personas[0]["Rebuilt_From_Sessions_JSONL"])
+
 
 class ScoringPipelineTests(unittest.TestCase):
     def test_score_persona_produces_table3_rows(self):
@@ -722,6 +815,103 @@ class ScoringPipelineTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # credential preflight
 # ---------------------------------------------------------------------------
+
+
+class EmbeddingBatchTests(unittest.TestCase):
+    """Cloud embedding endpoints cap the batch; Ollama does not."""
+
+    class _Recorder:
+        def __init__(self):
+            self.calls = []
+
+        def embed_texts(self, texts):
+            self.calls.append(list(texts))
+            return [[float(len(str(t)))] for t in texts]
+
+    def test_dashscope_limit_is_ten(self):
+        self.assertEqual(embed_batch_limit("dashscope_bailian"), 10)
+
+    def test_ollama_and_openai_are_not_chunked(self):
+        self.assertIsNone(embed_batch_limit("ollama"))
+        self.assertIsNone(embed_batch_limit("openai"))
+
+    def test_small_batch_passes_through_unchanged(self):
+        inner = self._Recorder()
+        client = BatchedEmbeddingClient(inner, 10)
+        out = client.embed_texts(["a", "b", "c"])
+        self.assertEqual(len(out), 3)
+        self.assertEqual(len(inner.calls), 1)
+
+    def test_large_batch_is_split_and_order_is_preserved(self):
+        inner = self._Recorder()
+        client = BatchedEmbeddingClient(inner, 10)
+        texts = [f"t{i}" for i in range(25)]
+        out = client.embed_texts(texts)
+        self.assertEqual([len(call) for call in inner.calls], [10, 10, 5])
+        self.assertEqual(len(out), 25)
+        self.assertEqual(out[0], [2.0])      # "t0"
+        self.assertEqual(out[24], [3.0])     # "t24"
+        self.assertEqual(client.batch_count, 3)
+
+    def test_empty_input_makes_no_request(self):
+        inner = self._Recorder()
+        self.assertEqual(BatchedEmbeddingClient(inner, 10).embed_texts([]), [])
+        self.assertEqual(inner.calls, [])
+
+    def test_wrap_only_applies_to_limited_providers(self):
+        inner = self._Recorder()
+        self.assertIs(wrap_embedding_client(inner, "ollama"), inner)
+        wrapped = wrap_embedding_client(inner, "dashscope_bailian")
+        self.assertIsInstance(wrapped, BatchedEmbeddingClient)
+        self.assertIs(wrap_embedding_client(wrapped, "dashscope_bailian"), wrapped)
+
+    def test_transient_errors_are_retried_then_succeed(self):
+        import requests
+
+        class Flaky:
+            def __init__(self):
+                self.calls = 0
+
+            def embed_texts(self, texts):
+                self.calls += 1
+                if self.calls < 3:
+                    raise requests.exceptions.ChunkedEncodingError("ended prematurely")
+                return [[1.0] for _ in texts]
+
+        client = BatchedEmbeddingClient(Flaky(), 10, backoff_seconds=0.0)
+        self.assertEqual(client.embed_texts(["a"]), [[1.0]])
+        self.assertEqual(client.retry_count, 2)
+
+    def test_hard_client_errors_are_not_retried(self):
+        import requests
+
+        class BadRequest:
+            def __init__(self):
+                self.calls = 0
+
+            def embed_texts(self, texts):
+                self.calls += 1
+                response = requests.Response()
+                response.status_code = 400
+                raise requests.exceptions.HTTPError("400 Client Error", response=response)
+
+        inner = BadRequest()
+        client = BatchedEmbeddingClient(inner, 10, backoff_seconds=0.0)
+        with self.assertRaises(requests.exceptions.HTTPError):
+            client.embed_texts(["a"])
+        self.assertEqual(inner.calls, 1)
+        self.assertEqual(client.retry_count, 0)
+
+    def test_transient_classification(self):
+        import requests
+
+        self.assertTrue(_is_transient(requests.exceptions.Timeout("slow")))
+        self.assertTrue(_is_transient(requests.exceptions.ChunkedEncodingError("cut")))
+        response = requests.Response()
+        response.status_code = 503
+        self.assertTrue(_is_transient(requests.exceptions.HTTPError("503", response=response)))
+        response.status_code = 400
+        self.assertFalse(_is_transient(requests.exceptions.HTTPError("400", response=response)))
 
 
 class CredentialPreflightTests(unittest.TestCase):

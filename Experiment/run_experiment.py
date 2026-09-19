@@ -65,6 +65,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Only run the first N personas (after --start-index). Smoke tests use 1.",
     )
     parser.add_argument(
+        "--max-sessions",
+        type=int,
+        default=None,
+        help=(
+            "Only replay the first N sessions of each persona. Intended for "
+            "pipeline smoke tests: it truncates the session chain, so the later "
+            "sessions and their questions are skipped."
+        ),
+    )
+    parser.add_argument(
         "--top-k",
         type=int,
         default=3,
@@ -105,11 +115,16 @@ def run_persona(
     stored_top_k: int,
     version: str,
     keep_memory: bool,
+    max_sessions: int | None = None,
+    on_session: Any = None,
 ) -> dict[str, Any]:
     store_dir = store_dir_for(output_dir, persona, version)
     persona_start = time.perf_counter()
     sessions_out: list[dict[str, Any]] = []
     answered_questions = 0
+    sessions = persona.sessions
+    if max_sessions is not None:
+        sessions = sessions[: max(0, int(max_sessions))]
 
     with MemConflictMemory(
         store_dir=store_dir,
@@ -118,7 +133,7 @@ def run_persona(
         config_path=config_path,
         reset=not keep_memory,
     ) as memory:
-        for session in persona.sessions:
+        for session in sessions:
             ingest = memory.ingest_session(session)
             questions_out: list[dict[str, Any]] = []
             for question in session.questions:
@@ -160,6 +175,20 @@ def run_persona(
                     "Questions": questions_out,
                 }
             )
+            if on_session is not None:
+                on_session(
+                    {
+                        "Persona_ID": persona.persona_id,
+                        "Memory_System": runtime.MEMORY_SYSTEM_NAME,
+                        "Session_ID": session.session_id,
+                        "Date": session.date,
+                        "Session_Type": session.session_type,
+                        "Question_Trigger_Types": list(session.question_trigger_types),
+                        "Event_Types": list(session.event_types),
+                        "Ingest": ingest.to_dict(),
+                        "Questions": questions_out,
+                    }
+                )
 
     return {
         "Persona_ID": persona.persona_id,
@@ -168,6 +197,9 @@ def run_persona(
         "Memory_Store": str(store_dir),
         "Answer_Top_K": top_k,
         "Stored_Top_K": stored_top_k,
+        "Sessions_Replayed": len(sessions),
+        "Sessions_Available": len(persona.sessions),
+        "Truncated": max_sessions is not None,
         "Session_Count": len(sessions_out),
         "Answered_Question_Count": answered_questions,
         "Persona_Runtime_ms": (time.perf_counter() - persona_start) * 1000.0,
@@ -214,8 +246,20 @@ def main(argv: list[str] | None = None) -> int:
         print("        " + runtime.credential_hint(), file=sys.stderr)
         return 3
     results_path = output_dir / "results.jsonl"
+    sessions_path = output_dir / "sessions.jsonl"
 
-    with open(results_path, "w", encoding="utf-8") as handle:
+    # results.jsonl is only written once a persona finishes, so a long persona
+    # that dies part-way would otherwise lose every answered question. Every
+    # completed session is therefore also appended to sessions.jsonl, which
+    # run_scoring.py can fall back to.
+    with open(results_path, "w", encoding="utf-8") as handle, open(
+        sessions_path, "w", encoding="utf-8"
+    ) as sessions_handle:
+
+        def record_session(row: dict[str, Any]) -> None:
+            sessions_handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            sessions_handle.flush()
+
         for index, persona in enumerate(personas, start=1):
             print(
                 f"[persona {index}/{len(personas)}] {persona.persona_id} "
@@ -230,6 +274,8 @@ def main(argv: list[str] | None = None) -> int:
                 stored_top_k=args.stored_top_k,
                 version=args.version,
                 keep_memory=args.keep_memory,
+                max_sessions=args.max_sessions,
+                on_session=record_session,
             )
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             handle.flush()
@@ -245,9 +291,11 @@ def main(argv: list[str] | None = None) -> int:
         "Config": str(Path(args.config).resolve()),
         "Answer_Top_K": args.top_k,
         "Stored_Top_K": args.stored_top_k,
+        "Max_Sessions": args.max_sessions,
         "Version": args.version,
         "Dataset_Summary": summary,
         "Results_Path": str(results_path),
+        "Sessions_Path": str(sessions_path),
         "Created_At": datetime.now().isoformat(timespec="seconds"),
     }
     (output_dir / "run_meta.json").write_text(

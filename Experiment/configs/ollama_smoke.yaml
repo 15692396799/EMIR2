@@ -1,0 +1,101 @@
+# Point 11/12 smoke config: every role served by the GPU server's Ollama.
+#
+# This is the faithful setup -- it uses exactly the models the upstream
+# `Retrival-Mem/configs/default.yaml` asks for, with no substitutions:
+#   embedding          -> qwen3-embedding
+#   every chat role    -> qwen3.5:latest
+#
+# API cost is zero (own GPUs). The trade-off is wall-clock time: the builder
+# emits ~10k output tokens per session, which a 9.7B Q4 model on one GPU will
+# not do quickly.
+#
+# Reach the server through the SSH tunnel first:
+#   ssh -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa \
+#       -N -L 41135:127.0.0.1:41135 tx@172.26.4.254
+# then Experiment/.env points at http://127.0.0.1:41135.
+
+experiment:
+  track: evaluation
+models:
+  embedding:
+    provider: ollama
+    model: qwen3-embedding
+    base_url_env: OLLAMA_BASE_URL
+    timeout: 600
+  memory_builder: &ollama_chat
+    provider: ollama
+    model: qwen3.5:latest
+    base_url_env: OLLAMA_BASE_URL
+    temperature: 0.0
+    # A single extraction can run to tens of thousands of tokens; keep the
+    # timeout generous so a slow-but-progressing call is not killed.
+    timeout: 3600
+    # The memory-builder payload averages ~11.3k tokens, and the V4 client never
+    # sends num_ctx, so the server default would otherwise decide the window.
+    # Passing it as an option makes the window explicit regardless of how the
+    # container was started. (extra keys are forwarded to Ollama verbatim.)
+    num_ctx: 32768
+  adjudication_model: *ollama_chat
+  window_planner: *ollama_chat
+  entity_judge: *ollama_chat
+  controller: *ollama_chat
+  decomposition_gate: *ollama_chat
+  slm: *ollama_chat
+  answer_model: *ollama_chat
+  judge_model: *ollama_chat
+memory:
+  backend: v4
+  memory_extraction_batch_turns: 64
+  # One GPU per Ollama container: keep concurrency low so calls queue instead
+  # of thrashing the single device.
+  memory_extraction_workers: 2
+  llm_max_retries: 2
+  llm_retry_backoff_seconds: 2.0
+  include_retrieval_trace_in_answer_prompt: false
+  answer_context_mode: content aware
+  backends:
+    v4:
+      database_path: data/memconflict_ollama.sqlite3
+      faiss_path: data/memconflict_ollama_faiss
+      memory_builder_model: memory_builder
+      semantic_state_model: null
+      embedding_model: embedding
+      entity_judge_batch_size: 8
+      entity_judge_workers: 2
+      entity_auto_merge_policy: conservative
+      # The upstream 8192 default was sized for LoCoMo. MemConflict sessions are
+      # ~3x larger and their extraction exceeds 8192, which truncated the JSON.
+      prompt_output_tokens:
+        memory_builder: 32768
+        semantic_reducer: 8192
+        window_boundary: 512
+        entity_judge: 2048
+        cross_window_adjudication: 4096
+      window_planner:
+        mode: model
+        token_encoding: cl100k_base
+        min_builder_input_tokens: 2048
+        target_builder_input_tokens: 12000
+        max_builder_input_tokens: 30000
+        max_window_turns: 0
+        max_window_atoms: 64
+retrieval:
+  strategy: multi_round
+  controller_profile: teacher
+  strategies:
+    multi_round:
+      controller_model: controller
+      controller_max_retries: 2
+      rank_fusion_constant: 60
+      model_evidence_filter_enabled: false
+evaluation:
+  benchmarks:
+  - locomo
+  benchmark_dir: benchmark
+  output_dir: runs
+  locomo:
+    answer_workers: 2
+    answer_chunk_size: 1
+    judge_workers: 2
+    answer_max_retries: 2
+    use_llm_judge: true

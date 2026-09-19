@@ -1,0 +1,33 @@
+# Upstream clone metadata, moved aside so this workspace tracks as one repo.
+# See README.md for how to restore the original Retrival-Mem / MemConflict clones.
+.upstream_git/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local environment files (never commit secrets)
+.env
+.env.*
+!.env.example
+
+# Runtime outputs
+runs/
+runs_smoke/
+*.log
+*.out
+*.err
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

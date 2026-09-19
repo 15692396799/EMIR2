@@ -1,0 +1,25 @@
+# Optional: --ollama-units-config configs/ollama_units.yaml
+# Without this option, the existing answer_workers/endpoints remain unchanged.
+units:
+  - name: default
+    mode: single
+    workers: 2
+    # Omit base_url_env to retain the existing OLLAMA_*_ENDPOINT settings.
+    # base_url_env: OLLAMA_LARGE_BASE_URL
+
+  - name: pair_1
+    mode: dual
+    workers: 1
+    chat_base_url_env: OLLAMA_PAIR1_CHAT_BASE_URL
+    embedding_base_url_env: OLLAMA_PAIR1_EMBED_BASE_URL
+
+  - name: pair_2
+    mode: dual
+    workers: 1
+    chat_base_url_env: OLLAMA_PAIR2_CHAT_BASE_URL
+    embedding_base_url_env: OLLAMA_PAIR2_EMBED_BASE_URL
+
+  - name: single_3
+    mode: single
+    workers: 2
+    base_url_env: OLLAMA_SINGLE3_BASE_URL

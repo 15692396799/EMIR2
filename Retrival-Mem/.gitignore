@@ -1,0 +1,88 @@
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tmp/
+# Local archives at any depth; keep out of future commits.
+archive/
+papers/
+.reasonix/
+
+
+# Virtual environments and local environment files
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+!.env.example
+
+# Build and package outputs
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Runtime outputs, logs, and local databases
+runs/
+runs_smoke/
+data/
+*.log
+*.out
+*.err
+*.sqlite
+*.sqlite3
+*.db
+
+# Benchmark data artifacts
+benchmark/**/*.zip
+# Only LoCoMo stays in version control; every other corpus is local-only.
+/benchmark/*
+!/benchmark/locomo/
+
+# Local tool and editor state
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+__MACOSX/
+
+.agents/
+.claude/
+.codex/
+papers/
+
+logs/
+
+third_party/
+
+# Local-only project tooling, tests, and documentation
+/.planning/
+/.reasonix/
+/.tmp/
+/papers/
+/tests/
+/.cbmignore
+/AGENTS.md
+/docs/
+/CLAUDE.md
+/findings.md
+/opencode.json
+/progress.md
+/pyproject.toml
+/reasonix.toml
+/task_plan.md
+.codebase-memory/.gitattributes
+.codebase-memory/artifact.json
+.codebase-memory/graph.db.zst

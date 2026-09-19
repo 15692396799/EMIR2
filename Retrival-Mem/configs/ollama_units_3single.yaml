@@ -1,0 +1,13 @@
+units:
+  - name: single_41134
+    mode: single
+    workers: 2
+    base_url_env: OLLAMA_SINGLE3_BASE_URL
+  - name: single_41135
+    mode: single
+    workers: 2
+    base_url_env: OLLAMA_BASE_URL
+  - name: single_41136
+    mode: single
+    workers: 2
+    base_url_env: OLLAMA_UNIT_41136_BASE_URL

@@ -1,0 +1,126 @@
+# Ollama retrieval; synchronous answers and OpenRouter GPT judging.
+experiment:
+  track: evaluation
+models:
+  embedding:
+    provider: ollama
+    model: qwen3-embedding
+    base_url_env: OLLAMA_BASE_URL
+  memory_builder: &id001
+    provider: dashscope_bailian
+    model: glm-5.1
+    api_key_env: DASHSCOPE_API_KEY
+    chat_completions_endpoint_env: DASHSCOPE_CHAT_COMPLETIONS_ENDPOINT
+    temperature: 0.0
+    timeout: 60
+    extra_body:
+      max_tokens: 32768
+  adjudication_model: *id001
+  window_planner:
+    provider: ollama
+    model: qwen3.5:latest
+    base_url_env: OLLAMA_BASE_URL
+    temperature: 0.0
+    num_predict: 256
+    timeout: 600
+  entity_judge:
+    provider: ollama
+    model: qwen3.5:latest
+    base_url_env: OLLAMA_BASE_URL
+    temperature: 0.0
+  controller: &id002
+    provider: ollama
+    model: qwen3.5:latest
+    base_url_env: OLLAMA_BASE_URL
+    temperature: 0.0
+    num_predict: 1024
+    timeout: 600
+  decomposition_gate:
+    provider: ollama
+    model: qwen3.5:latest
+    base_url_env: OLLAMA_BASE_URL
+    temperature: 0.0
+    num_predict: 32
+    timeout: 600
+  slm: *id002
+  answer_model:
+    provider: openrouter
+    model: anthropic/claude-sonnet-4.5
+    api_key_env: OPENROUTER_API_KEY
+    chat_completions_endpoint_env: OPENROUTER_CHAT_COMPLETIONS_ENDPOINT
+    temperature: 0.0
+    timeout: 60
+    extra_body:
+      max_tokens: 3072
+  judge_model:
+    provider: openrouter
+    model: openai/gpt-4o-mini
+    api_key_env: OPENROUTER_API_KEY
+    temperature: 0.0
+    timeout: 60
+    extra_body:
+      max_tokens: 128
+    chat_completions_endpoint_env: OPENROUTER_CHAT_COMPLETIONS_ENDPOINT
+memory:
+  backend: v4
+  memory_extraction_batch_turns: 64
+  memory_extraction_workers: 8
+  llm_max_retries: 2
+  llm_retry_backoff_seconds: 1.0
+  include_retrieval_trace_in_answer_prompt: false
+  answer_context_mode: content aware
+  backends:
+    v4:
+      database_path: data/locomo_v4_full.sqlite3
+      faiss_path: data/locomo_v4_full_faiss
+      memory_builder_model: memory_builder
+      semantic_state_model: null
+      embedding_model: embedding
+      entity_judge_batch_size: 8
+      entity_judge_workers: 2
+      entity_auto_merge_policy: conservative
+      window_planner:
+        mode: model
+        token_encoding: cl100k_base
+        min_builder_input_tokens: 2048
+        target_builder_input_tokens: 12000
+        max_builder_input_tokens: 30000
+        max_window_turns: 0
+        max_window_atoms: 64
+retrieval:
+  strategy: multi_round
+  controller_profile: teacher
+  strategies:
+    multi_round:
+      controller_model: controller
+      controller_max_retries: 2
+      rank_fusion_constant: 60
+      model_evidence_filter_enabled: false
+evaluation:
+  benchmarks:
+  - locomo
+  benchmark_dir: benchmark
+  output_dir: runs
+  locomo:
+    categories:
+    - '1'
+    - '2'
+    - '3'
+    - '4'
+    answer_only_frozen_retrieval: false
+    answer_evidence_first: true
+    answer_compact_json: true
+    answer_category_execution: false
+    answer_execution_contract_v2: false
+    answer_execution_recovery: false
+    answer_context_presentation: legacy
+    answer_max_retries: 2
+    answer_retry_backoff_seconds: 1.0
+    use_llm_judge: true
+    answer_mode: single
+    judge_mode: single
+    judge_runs: 1
+    answer_workers: 4
+    answer_chunk_size: 1
+    judge_workers: 4
+    max_questions: null

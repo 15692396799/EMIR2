@@ -11,7 +11,8 @@ system on the **MemConflict** benchmark.
 | `MemConflict/` | Conflict benchmark, released data, and the evaluation harness. |
 | `MemConflict/Evaluation/eval_retrival_mem.py` | Retrival-Mem runner: replays the session chain, ingestion + retrieval + answering. |
 | `MemConflict/Evaluation/scoring_retrival_mem.py` | Scoring entry point (delegates to `eval_scoring.py`). |
-| `doc_by_human/` | Task notes. |
+| `doc_by_human/` | Task notes and the `Step4_4.jsonl` data-structure analysis. |
+| `doc_by_human/Step4_4_record1_analysis.md` | Field-by-field breakdown of the first record of the benchmark data. |
 
 ## Upstream sources
 

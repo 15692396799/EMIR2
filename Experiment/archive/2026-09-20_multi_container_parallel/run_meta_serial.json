@@ -1,0 +1,37 @@
+{
+  "Memory_System": "retrival_mem_v4",
+  "Dataset": "E:\\code\\github\\EMIR2\\MemConflict\\Data\\Step4_4.jsonl",
+  "Retrival_Mem_Root": "E:\\code\\github\\EMIR2\\Retrival-Mem",
+  "Config": "E:\\code\\github\\EMIR2\\Experiment\\configs\\eval_large.yaml",
+  "Answer_Top_K": 3,
+  "Stored_Top_K": 5,
+  "Max_Sessions": 1,
+  "Version": "v1",
+  "Persona_Workers": 1,
+  "Ollama_Units": [
+    "http://172.26.94.12:41135"
+  ],
+  "Persona_Unit_Assignments": {
+    "9841f645-49ad-3de3-9010-cef938781102": "http://172.26.94.12:41135",
+    "75b15745-6d32-726b-be79-d765808bbfe7": "http://172.26.94.12:41135",
+    "2e62aacf-70e2-3d5a-b6bd-6f9ad776893d": "http://172.26.94.12:41135",
+    "5a40c38b-61aa-afc0-1837-4367df2efbc1": "http://172.26.94.12:41135"
+  },
+  "Failed_Personas": [],
+  "Errors_Path": "Experiment\\runs\\ab_serial_0920_105617\\errors.jsonl",
+  "Wall_Clock_s": 2439.874,
+  "Dataset_Summary": {
+    "Persona_Count": 4,
+    "Session_Count": 208,
+    "Triggered_Session_Count": 172,
+    "Question_Count": 494,
+    "Question_Count_By_Conflict_Type": {
+      "dynamic_conflict": 386,
+      "static_conflict": 48,
+      "conditional_conflict": 60
+    }
+  },
+  "Results_Path": "Experiment\\runs\\ab_serial_0920_105617\\results.jsonl",
+  "Sessions_Path": "Experiment\\runs\\ab_serial_0920_105617\\sessions.jsonl",
+  "Created_At": "2026-09-20T11:36:58"
+}

@@ -1,4 +1,4 @@
-"""Points 8+9: judge the answers and produce the conflict-aware table.
+"""Points 8+9 (+16/17): judge the answers and produce the conflict-aware table.
 
 Reads a ``results.jsonl`` produced by ``run_experiment.py``, judges every answer
 with the MemConflict judge prompt, and writes:
@@ -8,24 +8,31 @@ with the MemConflict judge prompt, and writes:
 * ``metrics.json``  - the aggregated numbers;
 * ``table3.md``     - the Table 3 row for EMIR2.
 
+Personas are judged independently, so ``--judge-workers N`` scores N personas at
+once (point 17); an Ollama judge is additionally routed over the containers
+listed in ``OLLAMA_BASE_URLS`` (point 16), one persona per unit.
+
 Usage::
 
     python Experiment/run_scoring.py --run-dir Experiment/runs/<timestamp>
+    python Experiment/run_scoring.py --run-dir <dir> --judge-workers 4
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
-from datetime import datetime
 from pathlib import Path
+from datetime import datetime
 from typing import Any
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from memconflict_eval import runtime  # noqa: E402
+from memconflict_eval import ollama_units, parallel  # noqa: E402
 from memconflict_eval.data import Question  # noqa: E402
 from memconflict_eval.judging import MemConflictJudge  # noqa: E402
 from memconflict_eval.memory import RetrievedMemory  # noqa: E402
@@ -60,6 +67,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         default=runtime.default_config_path(),
         help="Retrival-Mem config supplying the judge model.",
+    )
+    parser.add_argument(
+        "--judge-workers",
+        type=int,
+        default=1,
+        help=(
+            "Point 17: judge this many personas at once in separate processes. "
+            "1 = the original in-process loop."
+        ),
+    )
+    parser.add_argument(
+        "--ollama-units",
+        type=str,
+        default=None,
+        help=(
+            "Point 16: comma-separated Ollama container base URLs, overriding "
+            "OLLAMA_BASE_URLS from Experiment/.env (only matters when the judge "
+            "model itself is an Ollama model)."
+        ),
     )
     parser.add_argument("--method-name", type=str, default="EMIR²")
     return parser
@@ -133,6 +159,29 @@ def score_persona(
     scored_persona = dict(persona)
     scored_persona["Sessions"] = sessions_out
     return scored_persona, flat
+
+
+def judge_job(payload: dict[str, Any]) -> dict[str, Any]:
+    """Judge one persona: in this process, or in a worker process (point 17).
+
+    The Ollama unit of point 16 is applied before the judge client is built, so
+    an Ollama judge spreads over the containers exactly like the runner does.
+    """
+    unit = payload.get("unit")
+    if unit:
+        ollama_units.apply_unit(str(unit))
+    else:
+        ollama_units.clear_unit()
+    top_k = int(payload["top_k"])
+    config = runtime.load_memory_config(Path(payload["config_path"]))
+    judge = MemConflictJudge(config, top_k=top_k)
+    scored_persona, flat = score_persona(payload["persona"], judge=judge, top_k=top_k)
+    return {
+        "Persona_ID": scored_persona.get("Persona_ID"),
+        "Ollama_Unit": unit or "",
+        "Scored_Persona": scored_persona,
+        "Questions": flat,
+    }
 
 
 def load_personas_from_results(path: Path) -> list[dict[str, Any]]:
@@ -226,23 +275,67 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[input] results  : {results_path}")
 
     try:
-        judge = MemConflictJudge(config, top_k=args.top_k)
+        runtime.load_env_file()
+    except Exception as error:  # the .env file is optional; credentials still checked below
+        print(f"[warn] could not load the .env file: {type(error).__name__}: {error}", file=sys.stderr)
+    if args.ollama_units:
+        os.environ[ollama_units.UNITS_ENV] = str(args.ollama_units)
+    units = ollama_units.configured_units()
+    judge_workers = max(1, int(args.judge_workers))
+    if units:
+        print(f"[ollama] units   : {len(units)} ({', '.join(units)})")
+    if judge_workers > 1:
+        print(f"[judge] workers  : {judge_workers} process(es)")
+
+    try:
+        MemConflictJudge(config, top_k=args.top_k)
     except Exception as error:
         print(f"[error] could not build the judge model: {type(error).__name__}: {error}", file=sys.stderr)
         print("        " + runtime.credential_hint(), file=sys.stderr)
         return 3
-    scored_rows: list[dict[str, Any]] = []
-    all_questions: list[dict[str, Any]] = []
 
-    for index, persona in enumerate(personas, start=1):
-        scored_persona, flat = score_persona(persona, judge=judge, top_k=args.top_k)
+    # Point 16: one container per persona, round robin (only matters when the
+    # judge itself is an Ollama model). Point 17: judge several personas at once.
+    assignments = ollama_units.assign_units(units, len(personas))
+    scored_rows: list[dict[str, Any] | None] = [None] * len(personas)
+    flat_rows: list[list[dict[str, Any]]] = [[] for _ in personas]
+    failed_personas: list[str] = []
+    jobs = [
+        {
+            "persona": persona,
+            "config_path": str(args.config),
+            "top_k": args.top_k,
+            "unit": assignments[index],
+        }
+        for index, persona in enumerate(personas)
+    ]
+
+    def collect(index: int, payload: dict[str, Any]) -> None:
+        if isinstance(payload, parallel.JobError):
+            failed_personas.append(str(personas[index].get("Persona_ID") or index))
+            print(
+                f"[fail] persona {index + 1}/{len(personas)} "
+                f"{personas[index].get('Persona_ID')} was not judged: {payload.summary}"
+            )
+            return
+        scored_persona = payload["Scored_Persona"]
+        flat = payload["Questions"]
         scored_persona["Evaluated_Question_Count"] = len(flat)
-        scored_rows.append(scored_persona)
-        all_questions.extend(flat)
+        scored_rows[index] = scored_persona
+        flat_rows[index] = flat
         print(
-            f"[persona {index}/{len(personas)}] {persona.get('Persona_ID')} "
-            f"judged {len(flat)} questions"
+            f"[persona {index + 1}/{len(personas)}] {payload.get('Persona_ID')} "
+            f"judged {len(flat)} questions "
+            f"(unit {payload.get('Ollama_Unit') or 'config default'})"
         )
+
+    parallel.run_jobs(
+        judge_job, jobs, workers=judge_workers, on_result=collect, raise_errors=False
+    )
+    scored_rows = [row for row in scored_rows if row is not None]
+    all_questions: list[dict[str, Any]] = [
+        question for flat in flat_rows for question in flat
+    ]
 
     metrics = aggregate(all_questions)
     scores_path = output_dir / "scores.jsonl"
@@ -283,6 +376,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[done] scores  : {scores_path}")
     print(f"[done] metrics : {output_dir / 'metrics.json'}")
     print(f"[done] table   : {output_dir / 'table3.md'}")
+    if failed_personas:
+        print(
+            f"[fail] {len(failed_personas)}/{len(personas)} persona(s) were not "
+            "judged: " + ", ".join(failed_personas),
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

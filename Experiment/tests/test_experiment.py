@@ -12,8 +12,10 @@ only.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,6 +39,7 @@ from memconflict_eval.judging import (  # noqa: E402
     _coerce_rank,
 )
 from memconflict_eval.memory import MemConflictMemory, RetrievedMemory, store_dir_for  # noqa: E402
+from memconflict_eval import ollama_units, parallel  # noqa: E402
 from memconflict_eval.embedding import (  # noqa: E402
     BatchedEmbeddingClient,
     _is_transient,
@@ -975,6 +978,384 @@ class CredentialPreflightTests(unittest.TestCase):
                 path.parent == EXPERIMENT_DIR
                 or path.parent == runtime.retrival_mem_root()
             )
+        )
+
+
+def _save_env(*names):
+    return {name: os.environ.get(name) for name in names}
+
+
+def _restore_env(saved):
+    for name, value in saved.items():
+        os.environ.pop(name, None)
+        if value is not None:
+            os.environ[name] = value
+
+
+def _parallel_worker(payload):
+    """Module-level so the process pool can pickle it (spawn re-imports)."""
+    payload["progress"].put({"job": payload["job"], "pid": os.getpid()})
+    return {"job": payload["job"], "pid": os.getpid()}
+
+
+def _sleepy_worker(payload):
+    """Stands in for a persona: the LLM calls are what make it slow."""
+    time.sleep(float(payload["seconds"]))
+    payload["progress"].put({"job": payload["job"], "pid": os.getpid()})
+    return payload["job"]
+
+
+class _UnpicklableError(RuntimeError):
+    """Mimics V4StageError: rebuilt by pickle with the wrong arguments."""
+
+    def __init__(self, context, attempts, cause):
+        self.context = context
+        self.attempts = attempts
+        self.cause = cause
+        super().__init__(f"stage failed: {context}")
+
+
+def _failing_worker(payload):
+    """Fails like a bad builder completion does, with an unpicklable error."""
+    if payload["job"] == 1:
+        raise _UnpicklableError("memory_builder", 2, ValueError("invalid JSON"))
+    payload["progress"].put({"job": payload["job"], "pid": os.getpid()})
+    return {"job": payload["job"]}
+
+
+class _RowCollector:
+    """Minimal stand-in for the progress sink a job receives."""
+
+    def __init__(self):
+        self.rows = []
+
+    def put(self, row):
+        self.rows.append(row)
+
+
+class OllamaUnitTests(unittest.TestCase):
+    """Point 16: one Ollama container per GPU, one container per worker."""
+
+    def test_unit_list_is_split_deduplicated_and_ordered(self):
+        units = ollama_units.parse_base_urls(
+            " http://gpu:41133, http://gpu:41134 ; http://gpu:41133 "
+        )
+        self.assertEqual(units, ["http://gpu:41133", "http://gpu:41134"])
+
+    def test_base_url_must_be_a_service_root(self):
+        for bad in ("gpu:41133", "http://gpu:41133/api/chat", "http://u:p@gpu:1", ""):
+            with self.assertRaises(ValueError):
+                ollama_units.normalize_base_url(bad)
+
+    def test_trailing_slash_is_stripped(self):
+        self.assertEqual(
+            ollama_units.normalize_base_url("http://gpu:41133/"), "http://gpu:41133"
+        )
+
+    def test_units_prefer_the_list_variable_over_the_single_one(self):
+        saved = _save_env("OLLAMA_BASE_URLS", "OLLAMA_BASE_URL")
+        try:
+            os.environ["OLLAMA_BASE_URLS"] = "http://gpu:1,http://gpu:2"
+            os.environ["OLLAMA_BASE_URL"] = "http://gpu:9"
+            self.assertEqual(
+                ollama_units.configured_units(), ["http://gpu:1", "http://gpu:2"]
+            )
+            os.environ.pop("OLLAMA_BASE_URLS")
+            self.assertEqual(ollama_units.configured_units(), ["http://gpu:9"])
+            os.environ.pop("OLLAMA_BASE_URL")
+            self.assertEqual(ollama_units.configured_units(), [])
+        finally:
+            _restore_env(saved)
+
+    def test_apply_unit_rewrites_every_endpoint_the_clients_read(self):
+        saved = _save_env(*ollama_units.ENDPOINT_ENV_KEYS, ollama_units.ACTIVE_UNIT_ENV)
+        try:
+            values = ollama_units.apply_unit("http://gpu:41134/")
+            self.assertEqual(values["OLLAMA_BASE_URL"], "http://gpu:41134")
+            self.assertEqual(values["OLLAMA_CHAT_ENDPOINT"], "http://gpu:41134/api/chat")
+            self.assertEqual(values["OLLAMA_EMBED_ENDPOINT"], "http://gpu:41134/api/embed")
+            self.assertEqual(
+                values["OLLAMA_LEGACY_EMBEDDINGS_ENDPOINT"],
+                "http://gpu:41134/api/embeddings",
+            )
+            self.assertEqual(ollama_units.active_unit(), "http://gpu:41134")
+            ollama_units.clear_unit()
+            self.assertIsNone(ollama_units.active_unit())
+        finally:
+            _restore_env(saved)
+
+    def test_personas_rotate_over_the_units(self):
+        self.assertEqual(
+            ollama_units.assign_units(["http://gpu:1", "http://gpu:2"], 5),
+            ["http://gpu:1", "http://gpu:2", "http://gpu:1", "http://gpu:2", "http://gpu:1"],
+        )
+        self.assertEqual(ollama_units.assign_units([], 2), [None, None])
+
+
+class UnitRoutingTests(unittest.TestCase):
+    def test_load_memory_config_reapplies_the_unit_after_the_env_file(self):
+        """Retrival-Mem loads .env with override=True, so the unit must win."""
+        import importlib
+
+        # Earlier tests stub runtime.load_memory_config; reload the real one.
+        importlib.reload(runtime)
+        saved = _save_env(*ollama_units.ENDPOINT_ENV_KEYS, ollama_units.ACTIVE_UNIT_ENV)
+        calls = []
+        original_import = runtime.import_retrival_mem
+
+        def fake_load_config(path, env_path=None):
+            # What load_dotenv(override=True) does to os.environ.
+            os.environ["OLLAMA_CHAT_ENDPOINT"] = "http://dotenv:1/api/chat"
+            calls.append((path, env_path))
+            return SimpleNamespace()
+
+        runtime.import_retrival_mem = lambda root=None: SimpleNamespace(
+            load_config=fake_load_config
+        )
+        try:
+            os.environ[ollama_units.ACTIVE_UNIT_ENV] = "http://gpu:41136"
+            runtime.load_memory_config(Path("config.yaml"))
+            self.assertEqual(
+                os.environ["OLLAMA_CHAT_ENDPOINT"], "http://gpu:41136/api/chat"
+            )
+            self.assertEqual(calls, [(Path("config.yaml"), runtime.default_env_path())])
+        finally:
+            runtime.import_retrival_mem = original_import
+            _restore_env(saved)
+
+
+class ParallelPersonaTests(unittest.TestCase):
+    """Point 17: personas run side by side, results keep the dataset order."""
+
+    def test_single_worker_keeps_input_order_and_streams_rows(self):
+        rows, delivered = [], []
+        results = parallel.run_jobs(
+            _parallel_worker,
+            [{"job": index} for index in range(4)],
+            workers=1,
+            on_row=rows.append,
+            on_result=lambda index, _value: delivered.append(index),
+        )
+        self.assertEqual([row["job"] for row in results], [0, 1, 2, 3])
+        self.assertEqual([row["job"] for row in rows], [0, 1, 2, 3])
+        self.assertEqual(delivered, [0, 1, 2, 3])
+
+    def test_process_pool_spreads_personas_over_processes(self):
+        rows = []
+        results = parallel.run_jobs(
+            _parallel_worker,
+            [{"job": index} for index in range(4)],
+            workers=2,
+            on_row=rows.append,
+        )
+        self.assertEqual([row["job"] for row in results], [0, 1, 2, 3])
+        self.assertGreater(len({row["pid"] for row in results}), 1)
+        self.assertNotIn(os.getpid(), {row["pid"] for row in results})
+        self.assertEqual(len(rows), 4)
+
+    def test_empty_job_list_is_a_no_op(self):
+        self.assertEqual(parallel.run_jobs(_parallel_worker, [], workers=3), [])
+
+    def test_unpicklable_worker_error_becomes_a_job_error(self):
+        """V4StageError cannot be pickled; the pool must not die over that."""
+        with self.assertRaises(parallel.JobError) as caught:
+            parallel.run_jobs(_failing_worker, [{"job": 0}, {"job": 1}], workers=2)
+        self.assertIn("_UnpicklableError", str(caught.exception))
+
+    def test_a_failed_persona_does_not_stop_the_others(self):
+        results = parallel.run_jobs(
+            _failing_worker,
+            [{"job": index} for index in range(3)],
+            workers=2,
+            raise_errors=False,
+        )
+        self.assertEqual(results[0]["job"], 0)
+        self.assertIsInstance(results[1], parallel.JobError)
+        self.assertIn("memory_builder", str(results[1]))
+        self.assertIn("_UnpicklableError", results[1].traceback_text)
+        self.assertEqual(results[2]["job"], 2)
+
+    def test_process_pool_cuts_the_wall_clock(self):
+        """The scheduling, not the model, is what this proves.
+
+        Four personas that each need one second: serial costs four, four
+        workers cost about one. Replace ``_sleepy_worker`` with a real persona
+        and the same arithmetic is what points 16+17 buy on the GPU server.
+        """
+        jobs = [{"job": index, "seconds": 1.0} for index in range(4)]
+        started = time.perf_counter()
+        parallel.run_jobs(_sleepy_worker, jobs, workers=1)
+        serial = time.perf_counter() - started
+        started = time.perf_counter()
+        parallel.run_jobs(_sleepy_worker, jobs, workers=4)
+        pooled = time.perf_counter() - started
+        self.assertGreater(serial, 3.5)
+        self.assertLess(pooled, serial * 0.6)
+        self.assertLess(pooled, 3.0)
+
+
+class RunnerMainWiringTests(unittest.TestCase):
+    """The unit list lives in .env, so it must be read after that file loads."""
+
+    def test_main_loads_the_env_file_before_it_reads_the_unit_list(self):
+        import importlib
+
+        importlib.reload(runtime)
+        from run_experiment import main
+
+        events = []
+        saved = _save_env(
+            ollama_units.UNITS_ENV,
+            "OLLAMA_EMBED_ENDPOINT",
+            "OLLAMA_LEGACY_EMBEDDINGS_ENDPOINT",
+        )
+        original_env_loader = runtime.load_env_file
+        original_units = ollama_units.configured_units
+        runtime.load_env_file = lambda: events.append("env-file")
+        ollama_units.configured_units = lambda: (events.append("units"), [])[1]
+        _patch_runtime(_FakeMemorySystem(), _FakeChatClient("ans"), _FakeChatClient())
+        try:
+            os.environ["OLLAMA_EMBED_ENDPOINT"] = "http://unit/api/embed"
+            os.environ["OLLAMA_LEGACY_EMBEDDINGS_ENDPOINT"] = "http://unit/api/embeddings"
+            with tempfile.TemporaryDirectory() as tmp:
+                code = main(
+                    [
+                        "--output-dir",
+                        tmp,
+                        "--persona-limit",
+                        "1",
+                        "--max-sessions",
+                        "2",
+                    ]
+                )
+                self.assertEqual(code, 0)
+                # The .env file is loaded first, otherwise OLLAMA_BASE_URLS is
+                # invisible and every persona falls back to one container.
+                self.assertEqual(events[:2], ["env-file", "units"])
+                meta = json.loads(
+                    (Path(tmp) / "run_meta.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(meta["Persona_Workers"], 1)
+                self.assertEqual(meta["Ollama_Units"], [])
+                self.assertTrue(
+                    (Path(tmp) / "results.jsonl").read_text(encoding="utf-8").strip()
+                )
+                self.assertEqual(
+                    len(
+                        (Path(tmp) / "sessions.jsonl")
+                        .read_text(encoding="utf-8")
+                        .strip()
+                        .splitlines()
+                    ),
+                    2,
+                )
+        finally:
+            runtime.load_env_file = original_env_loader
+            ollama_units.configured_units = original_units
+            _restore_env(saved)
+
+
+class PersonaJobTests(unittest.TestCase):
+    def _persona(self):
+        return parse_persona(
+            {
+                "ID": "persona-unit",
+                "Full_Session_Chain": [
+                    {
+                        "Session_ID": 0,
+                        "Date": "2022-01-03",
+                        "Session_Type": "initial_reveal",
+                        "Session_Dialogue": {
+                            "dialogue_turn_1": [{"role": "user", "content": "I live in Darwin."}],
+                        },
+                        "Session_Questions": [],
+                    }
+                ],
+            }
+        )
+
+    def test_persona_job_applies_its_unit_and_records_it(self):
+        from run_experiment import persona_job
+
+        _patch_runtime(_FakeMemorySystem(), _FakeChatClient("ans"), _FakeChatClient())
+        saved = _save_env(*ollama_units.ENDPOINT_ENV_KEYS, ollama_units.ACTIVE_UNIT_ENV)
+        collector = _RowCollector()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                record = persona_job(
+                    {
+                        "persona_index": 0,
+                        "persona": self._persona(),
+                        "output_dir": tmp,
+                        "config_path": "unused.yaml",
+                        "unit": "http://gpu:41136",
+                        "top_k": 2,
+                        "stored_top_k": 5,
+                        "version": "v1",
+                        "keep_memory": False,
+                        "max_sessions": None,
+                        "progress": collector,
+                    }
+                )
+            self.assertEqual(record["Ollama_Unit"], "http://gpu:41136")
+            self.assertEqual(
+                os.environ["OLLAMA_EMBED_ENDPOINT"], "http://gpu:41136/api/embed"
+            )
+            # The progress channel carries the lifecycle event and then one row
+            # per finished session (the log run_scoring.py falls back to).
+            events = [row for row in collector.rows if row.get("Event")]
+            sessions = [row for row in collector.rows if not row.get("Event")]
+            self.assertEqual([row["Event"] for row in events], ["persona_start"])
+            self.assertEqual([row["Session_ID"] for row in sessions], [0])
+            self.assertEqual(record["Answered_Question_Count"], 0)
+        finally:
+            _restore_env(saved)
+
+    def test_persona_job_without_a_unit_clears_the_assignment(self):
+        from run_experiment import persona_job
+
+        _patch_runtime(_FakeMemorySystem(), _FakeChatClient("ans"), _FakeChatClient())
+        saved = _save_env(*ollama_units.ENDPOINT_ENV_KEYS, ollama_units.ACTIVE_UNIT_ENV)
+        try:
+            os.environ[ollama_units.ACTIVE_UNIT_ENV] = "http://gpu:41133"
+            with tempfile.TemporaryDirectory() as tmp:
+                record = persona_job(
+                    {
+                        "persona_index": 0,
+                        "persona": self._persona(),
+                        "output_dir": tmp,
+                        "config_path": "unused.yaml",
+                        "unit": None,
+                        "top_k": 2,
+                        "stored_top_k": 5,
+                        "version": "v1",
+                        "keep_memory": False,
+                    }
+                )
+            self.assertEqual(record["Ollama_Unit"], "")
+            self.assertIsNone(ollama_units.active_unit())
+        finally:
+            _restore_env(saved)
+
+    def test_runners_expose_the_worker_flags(self):
+        from run_experiment import build_arg_parser as runner_parser
+        from run_scoring import build_arg_parser as scoring_parser
+
+        self.assertEqual(runner_parser().parse_args([]).persona_workers, 1)
+        self.assertEqual(
+            runner_parser().parse_args(["--persona-workers", "4"]).persona_workers, 4
+        )
+        self.assertEqual(
+            scoring_parser()
+            .parse_args(["--run-dir", "runs/x", "--judge-workers", "3"])
+            .judge_workers,
+            3,
+        )
+        self.assertEqual(
+            runner_parser()
+            .parse_args(["--ollama-units", "http://gpu:1,http://gpu:2"])
+            .ollama_units,
+            "http://gpu:1,http://gpu:2",
         )
 
 

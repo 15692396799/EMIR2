@@ -103,11 +103,38 @@ def import_retrival_mem(root: Path | None = None):
 
 
 def load_memory_config(config_path: Path | None = None):
-    """Load the Retrival-Mem config, reading ``Retrival-Mem/.env`` for secrets."""
+    """Load the Retrival-Mem config, reading ``Retrival-Mem/.env`` for secrets.
+
+    Point 16: ``load_config`` loads the ``.env`` file with ``override=True``, so
+    a persona worker's Ollama container assignment (``OLLAMA_BASE_URLS`` /
+    ``MEMCONFLICT_OLLAMA_UNIT``) has to be re-applied afterwards -- otherwise
+    every worker would silently fall back to the one endpoint written in
+    ``.env`` no matter how many containers are running.
+    """
+    from . import ollama_units
+
     runtime = import_retrival_mem()
     path = Path(config_path) if config_path else default_config_path()
     env_path = default_env_path()
-    return runtime.load_config(path, env_path=env_path)
+    config = runtime.load_config(path, env_path=env_path)
+    ollama_units.apply_active_unit()
+    return config
+
+
+def load_env_file() -> Path:
+    """Load the experiment's ``.env`` into ``os.environ`` (same file as above).
+
+    Used by the standalone tools, which need ``OLLAMA_BASE_URLS`` before any
+    config exists. ``load_dotenv`` is the upstream helper, so ``.env`` parsing
+    stays identical to a real run.
+    """
+    import_retrival_mem()  # puts Retrival-Mem/src on sys.path
+    from memory.config import load_dotenv  # type: ignore[import-not-found]
+
+    env_path = default_env_path()
+    if env_path.is_file():
+        load_dotenv(env_path, override=True)
+    return env_path
 
 
 # ---------------------------------------------------------------------------

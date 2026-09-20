@@ -35,7 +35,18 @@ models:
     # Passing it as an option makes the window explicit regardless of how the
     # container was started. (extra keys are forwarded to Ollama verbatim.)
     num_ctx: 32768
-  adjudication_model: *ollama_chat
+  # Cross-window adjudication must return a decision for EVERY candidate pair;
+  # the 9.7B model omits some (~20% of batches) and V4 does not retry validation
+  # failures (validation_retries defaults to 0), so the build aborts. Upstream
+  # `default.yaml` points this role at the same large model as the memory
+  # builder, so give it the bigger local model instead of the 9.7B one.
+  adjudication_model: &ollama_judge
+    provider: ollama
+    model: qwen3.5:27b
+    base_url_env: OLLAMA_BASE_URL
+    temperature: 0.0
+    timeout: 3600
+    num_ctx: 32768
   window_planner: *ollama_chat
   entity_judge: *ollama_chat
   controller: *ollama_chat

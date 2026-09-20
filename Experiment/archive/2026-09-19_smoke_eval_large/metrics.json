@@ -1,0 +1,39 @@
+{
+  "Memory_System": "retrival_mem_v4",
+  "Method": "EMIR²",
+  "White_Box_Top_K": 3,
+  "Scored_At": "2026-09-19T23:45:14",
+  "Metrics": {
+    "Question_Count": 2,
+    "Judge_Error_Count": 0,
+    "Average_AA": 0.5,
+    "Average_SEH@3": 0.5,
+    "Average_SRS": 0.5,
+    "By_Conflict_Type": {
+      "dynamic_conflict": {
+        "Question_Count": 2,
+        "Answer_Accuracy": 0.5,
+        "SEH@3": 0.5,
+        "SRS": 0.5,
+        "Conflict_Handling": 0.5,
+        "Judge_Error_Count": 0
+      },
+      "static_conflict": {
+        "Question_Count": 0,
+        "Answer_Accuracy": null,
+        "SEH@3": null,
+        "SRS": null,
+        "Conflict_Handling": null,
+        "Judge_Error_Count": 0
+      },
+      "conditional_conflict": {
+        "Question_Count": 0,
+        "Answer_Accuracy": null,
+        "SEH@3": null,
+        "SRS": null,
+        "Conflict_Handling": null,
+        "Judge_Error_Count": 0
+      }
+    }
+  }
+}

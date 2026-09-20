@@ -1,0 +1,24 @@
+{
+  "Memory_System": "retrival_mem_v4",
+  "Dataset": "E:\\code\\github\\EMIR2\\MemConflict\\Data\\Step4_4.jsonl",
+  "Retrival_Mem_Root": "E:\\code\\github\\EMIR2\\Retrival-Mem",
+  "Config": "E:\\code\\github\\EMIR2\\Experiment\\configs\\eval_large.yaml",
+  "Answer_Top_K": 3,
+  "Stored_Top_K": 5,
+  "Max_Sessions": 4,
+  "Version": "v1",
+  "Dataset_Summary": {
+    "Persona_Count": 1,
+    "Session_Count": 51,
+    "Triggered_Session_Count": 42,
+    "Question_Count": 107,
+    "Question_Count_By_Conflict_Type": {
+      "dynamic_conflict": 86,
+      "static_conflict": 12,
+      "conditional_conflict": 9
+    }
+  },
+  "Results_Path": "Experiment\\runs\\large_20260919_232108\\results.jsonl",
+  "Sessions_Path": "Experiment\\runs\\large_20260919_232108\\sessions.jsonl",
+  "Created_At": "2026-09-19T23:40:24"
+}

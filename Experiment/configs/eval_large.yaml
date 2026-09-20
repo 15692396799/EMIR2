@@ -83,7 +83,12 @@ memory:
         semantic_reducer: 8192
         window_boundary: 512
         entity_judge: 2048
-        cross_window_adjudication: 4096
+        # z-ai/glm-5.1 is a reasoning model. It intermittently spends its whole
+        # output budget on reasoning tokens and returns empty content, which
+        # fails the adjudication validation (it must return a decision for every
+        # candidate pair). 4096 was not enough headroom; measured reasoning runs
+        # reached 4091 tokens. Keep a large budget so reasoning + JSON both fit.
+        cross_window_adjudication: 16384
       window_planner:
         mode: model
         token_encoding: cl100k_base

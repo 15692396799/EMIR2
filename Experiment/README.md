@@ -125,18 +125,24 @@ all of it Ollama, with five workers queueing on a single container. The run is
 Ollama bound now, so every container you add removes real queueing.
 
 ```powershell
-# One persona worker per container (six lanes in .env, six workers).
-python Experiment\run_experiment.py --persona-workers 6
+# Default: ten persona workers over the six lanes (~1.7 per lane, ~34 GB of
+# committed memory on the laptop -- the ceiling for one terminal).
+python Experiment\run_experiment.py --persona-workers 10
 
-# Explicit lane list, one container per worker.
-python Experiment\run_experiment.py --persona-workers 6 `
+# Explicit lane list with the same worker count.
+python Experiment\run_experiment.py --persona-workers 10 `
   --ollama-units http://172.26.94.12:41135,http://172.26.94.12:41136,http://172.26.94.12:41133,http://172.26.94.12:41134,http://172.26.94.12:41137,http://172.26.94.12:41138
 
-# Two personas per container (more requests in flight per GPU; watch tok/s).
-python Experiment\run_experiment.py --persona-workers 12
-
 # Keep going while a container restarts: drop the dead lanes and use the rest.
-python Experiment\run_experiment.py --persona-workers 6 --allow-missing-units
+python Experiment\run_experiment.py --persona-workers 10 --allow-missing-units
+```
+
+A shard never runs more workers than it has personas, so `--persona-workers 10`
+only pays off with shards of ten or more: the default plan of 6 x 5 personas
+runs five workers whatever you pass. Use the matching plan when you want ten:
+
+```powershell
+python Experiment\tools\shard_plan.py --shards 3 --per-shard 10   # 3 x 10 personas
 ```
 
 `--persona-workers 1` is the original in-process loop, so results stay
@@ -264,6 +270,50 @@ checkout:
   (`Ingest.Retried_After_Validation_Error`, `Ingest.Stale_Checkpoints_Dropped`);
 * `MEMCONFLICT_CHECKPOINT_GUARD=0` turns the guard off (the raw upstream
   behaviour, useful when comparing against an unguarded run).
+
+### The semantic reducer ref guard
+
+The reducer prompt hands the model two ref lists: `event.trigger_event_ref` (the
+event the claim came from, copied out of the extraction answer) and
+`local_event_refs` (the events extracted in *this* window). Upstream validates
+the answer against the second list only, so a claim whose trigger was extracted
+in another window advertises a ref the answer may not cite; a model that cites
+the ref the prompt itself handed it is rejected with
+`semantic operation references evidence outside supplied local event refs`.
+Because the reducer role runs at `temperature: 0.0`, the retry produces the same
+answer: the checkpoint guard invalidates the namespace's cached units, re-runs
+the session, and the persona dies once that budget is spent -- session 0 of a
+fresh run shows it immediately, because nothing stale is involved, which is what
+makes the `[warn] ... retrying once` line look wrong there.
+
+This is the failure the point-33 model split made common: it happens with
+`memory_builder = openai/gpt-4o-mini` (weaker at keeping its refs inside the
+supplied window) and did not happen in the glm-5.1 runs of 2026-09-19/20
+(0 hits across every store on disk; the two gpt-4o-mini runs of 2026-09-21 hit
+it within minutes -- see the per-run table in the run notes).
+
+`_apply_reducer_update` resolves every cited ref through `event_refs` and
+silently drops the ones that miss, so an unresolvable ref cannot contribute
+anything to memory anyway. `memconflict_eval/reducer_guard.py` therefore drops
+exactly those refs: the request stops advertising an unresolvable trigger, and
+`evidence_event_refs` that cannot resolve are removed from the answer (the fact
+is still recorded, with the refs that do resolve). Extraction, adjudication,
+planner and entity-judge calls are never touched, a legal answer is returned
+byte for byte, and `MEMCONFLICT_REDUCER_GUARD=0` restores upstream behaviour.
+
+### The OpenRouter reasoning guard
+
+Upstream's `disable_request_thinking` rewrites every OpenRouter request to
+`"reasoning": {"enabled": false, "effort": "none"}`. Point 33 answers and judges
+with `openai/gpt-5-mini`, and that endpoint rejects the shape with
+`400 Reasoning is mandatory for this endpoint and cannot be disabled` -- a 400
+is not retryable, so every answer and judge call fails.
+`memconflict_eval/openrouter_reasoning.py` rewrites the field to
+`reasoning: {"effort": <effort>}` for the reasoning-mandatory families only
+(`gpt-5*`, `o1`, `o3`, `o4`); gpt-4o-mini, Bailian and Ollama keep the upstream
+request byte for byte. `MEMCONFLICT_REASONING_EFFORT=minimal|low|off` picks the
+effort (`off` drops the field and takes the provider default) and
+`MEMCONFLICT_REASONING_GUARD=0` switches the patch off.
 
 ### Interrupted runs: resume, and never lose finished work
 

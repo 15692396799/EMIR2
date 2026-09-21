@@ -501,7 +501,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--runs-root", type=Path, default=DEFAULT_RUNS_ROOT)
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--lock", type=Path, default=DEFAULT_LOCK)
-    parser.add_argument("--persona-workers", type=int, default=5)
+    parser.add_argument(
+        "--persona-workers",
+        type=int,
+        default=10,
+        help=(
+            "Personas processed at once per shard (default 10). Capped by the "
+            "personas in the shard, so a 5-persona shard still runs 5 workers."
+        ),
+    )
     parser.add_argument("--answer-workers", type=int, default=4)
     parser.add_argument("--extraction-workers", type=int, default=2)
     parser.add_argument("--entity-judge-workers", type=int, default=1)

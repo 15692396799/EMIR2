@@ -128,7 +128,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", type=Path, default=EXPERIMENT_DIR / "configs" / "eval_large_bailian.yaml")
     parser.add_argument("--runs-root", type=Path, default=DEFAULT_RUNS_ROOT)
     parser.add_argument("--out", type=Path, default=DEFAULT_MANIFEST)
-    parser.add_argument("--persona-workers", type=int, default=4)
+    parser.add_argument(
+        "--persona-workers",
+        type=int,
+        default=10,
+        help=(
+            "Personas processed at once (default 10: two per Ollama lane with "
+            "the six lanes of point 16). Capped by --per-shard, because a "
+            "shard never runs more workers than it has personas."
+        ),
+    )
     parser.add_argument("--answer-workers", type=int, default=4)
     parser.add_argument("--extraction-workers", type=int, default=2)
     parser.add_argument("--entity-judge-workers", type=int, default=1)

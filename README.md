@@ -97,7 +97,7 @@ How to read the results:
 | --- | --- | --- |
 | `check_ollama_units.py` | `[ok] ... vram=NN GB NN tok/s` | `[warn] ... size_vram=0` — the container lost its GPU device and is answering at CPU speed; rebuild it on the host |
 | `check_channels.py` runner roles | one `[ok]` line per role, a second or two each | `ProxyError` / `SSLError` / `ConnectionError` — the system proxy is down or unreachable, or `NO_PROXY` sneaked back into the shell; the run would otherwise fail inside `errors.jsonl` hours later |
-| `check_channels.py --roles judge_model` | `[ok] judge_model openrouter openai/gpt-4o-mini` | `403 ... not available in your region` — OpenRouter's OpenAI endpoint is geo-filtered; score with `--config Experiment\configs\eval_large_dsjudge.yaml` and say so when reporting the numbers |
+| `check_channels.py --roles judge_model` | `[ok] judge_model openrouter openai/gpt-5-mini` | `403 ... not available in your region` — OpenRouter's OpenAI endpoint is geo-filtered; score with `--config Experiment\configs\eval_large_dsjudge.yaml` and say so when reporting the numbers |
 
 `nvidia-smi` is not a valid container check: Ollama unloads a model after five
 idle minutes, so an empty GPU proves nothing. `check_ollama_units.py` sends one

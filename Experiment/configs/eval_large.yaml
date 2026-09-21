@@ -1,22 +1,36 @@
-# Point 11/13/33: large-model config for the real Table 3 scores.
+# Point 11/13/33/34: large-model config for the real Table 3 scores.
 #
 # Role split (documented so the run is reproducible):
 #   * embedding / controller / window_planner / entity_judge / decomposition_gate
 #     / slm -> the GPU server's Ollama, with exactly the models upstream
 #     `default.yaml` specifies (qwen3-embedding, qwen3.5:latest). No substitution.
-#   * memory_builder / adjudication -> OpenRouter openai/gpt-4o-mini (point 33:
-#     the memory-construction model moved here from z-ai/glm-5.1).
+#   * memory_builder / adjudication / semantic_reducer -> OpenRouter
+#     z-ai/glm-5.1 (point 34: back from openai/gpt-4o-mini, which point 33 had
+#     put here). The reducer follows memory_builder because
+#     `semantic_state_model` is null, so this one line moves the whole memory
+#     construction side back to glm-5.1.
 #   * answer_model / judge_model -> OpenRouter openai/gpt-5-mini (point 33: the
 #     answering role moved off z-ai/glm-5.1 and the judge off
 #     openai/gpt-4o-mini).
 #
-# Two constraints the swap brings with it:
-#   * gpt-4o-mini accepts at most 16,384 completion tokens, so
-#     `prompt_output_tokens.memory_builder` below is 16384 -- the provider
-#     rejects upstream's 32768 as an invalid max_tokens.
+# Two constraints to keep in mind:
+#   * glm-5.1 is a reasoning model, so both memory roles need a real output
+#     budget: `prompt_output_tokens.memory_builder` is 32768 and
+#     `cross_window_adjudication` is 16384 (4096 was not enough; measured
+#     reasoning runs reached 4091 tokens and the JSON arrived truncated).
 #   * gpt-5-mini is a reasoning model, so both roles that use it need a real
 #     output budget and a longer timeout than the models they replaced (see
 #     answer_model / judge_model below).
+#
+# Why glm-5.1 came back (point 34): with gpt-4o-mini on the memory side, the
+# reducer answered with `evidence_event_refs` from other windows, upstream
+# rejected it with "semantic operation references evidence outside supplied
+# local event refs", the checkpoint guard invalidated the namespace and re-ran
+# the session, and at temperature 0.0 the re-run reproduced the same answer --
+# shard_1 persona 3c2e5fe5 died on session 6 that way. Every store on disk
+# agrees: zero hits in the glm-5.1 runs of 2026-09-19/20, hits within minutes
+# in both gpt-4o-mini runs of 2026-09-21. The reducer guard stays installed as a
+# safety net for the other configurations.
 #
 # Reach the Ollama roles through the SSH tunnel first:
 #   ssh -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa \
@@ -26,7 +40,7 @@
 #
 # Requires OPENROUTER_API_KEY and OPENROUTER_CHAT_COMPLETIONS_ENDPOINT plus the
 # Ollama endpoints (OLLAMA_BASE_URL / OLLAMA_BASE_URLS) in Experiment/.env.
-# No DASHSCOPE_*: since point 33 no role of this config comes from Bailian.
+# No DASHSCOPE_*: every role of this config comes from OpenRouter or Ollama.
 
 experiment:
   track: evaluation
@@ -36,23 +50,28 @@ models:
     model: qwen3-embedding
     base_url_env: OLLAMA_BASE_URL
     timeout: 600
-  # Point 33: memory construction runs on openai/gpt-4o-mini.
-  # Same per-role max_tokens caveat as everywhere else in this config: the
-  # builder's real limit comes from prompt_output_tokens.memory_builder below.
+  # Point 34: memory construction runs on z-ai/glm-5.1 again (point 33 had moved
+  # it to openai/gpt-4o-mini; see the header for why it came back). The reducer
+  # inherits this block through `semantic_state_model: null`, so the whole
+  # memory side is glm-5.1.
+  # The builder's real limit comes from prompt_output_tokens.memory_builder
+  # below (32768); extra_body.max_tokens is the provider-side ceiling.
   memory_builder: &memory_chat
     provider: openrouter
-    model: openai/gpt-4o-mini
+    model: z-ai/glm-5.1
     api_key_env: OPENROUTER_API_KEY
     chat_completions_endpoint_env: OPENROUTER_CHAT_COMPLETIONS_ENDPOINT
     temperature: 0.0
     timeout: 300
     extra_body:
-      max_tokens: 16384
-      # gpt-4o-mini is served by OpenRouter's OpenAI and Azure endpoints; both
-      # are the same model, so a momentary geo-403 on OpenAI's endpoint does
-      # not kill a persona's ingest. allow_fallbacks keeps a long run alive.
+      max_tokens: 32768
+      # OpenRouter serves z-ai/glm-5.1 from 14 upstreams (Baidu, AtlasCloud,
+      # SiliconFlow, Z.AI, Venice, ...). Pin the Baidu Qianfan lane: the model is
+      # the same, but the provider (and its latency/region) is not.
+      # allow_fallbacks keeps a long run alive if Baidu is briefly unavailable;
+      # use `only: ["Baidu"]` instead for a hard pin.
       provider:
-        order: ["OpenAI", "Azure"]
+        order: ["Baidu"]
         allow_fallbacks: true
   adjudication_model: *memory_chat
   # Point 33: answering and judging both run on openai/gpt-5-mini -- one block,
@@ -116,20 +135,21 @@ memory:
       # See smoke_small.yaml: the upstream 8192 default is sized for LoCoMo and
       # truncates MemConflict extractions.
       prompt_output_tokens:
-        # gpt-4o-mini (point 33) caps completions at 16384 tokens; 32768 is
-        # rejected by the provider as an invalid max_tokens. 16384 is therefore
-        # both the headroom and the ceiling -- a session whose extraction JSON
-        # needs more will be truncated and fail validation, so watch
+        # Point 34: glm-5.1 is a reasoning model, so the extraction JSON shares
+        # this budget with its reasoning tokens. 32768 is what upstream
+        # `default.yaml` uses for the same model; shortening it truncates the
+        # JSON and fails validation, so watch
         # Ingest.Retried_After_Validation_Error in sessions.jsonl.
-        memory_builder: 16384
+        memory_builder: 32768
         semantic_reducer: 8192
         window_boundary: 512
         entity_judge: 2048
-        # Was sized for z-ai/glm-5.1, whose reasoning tokens ate the budget
-        # (4096 was not enough; measured runs reached 4091 reasoning tokens) and
-        # whose failures looked like truncated JSON. gpt-4o-mini (point 33)
-        # spends none of it on reasoning, so the budget is pure JSON headroom;
-        # 16384 is also its hard completion cap, which keeps the value valid.
+        # z-ai/glm-5.1 is a reasoning model (it is the adjudicator again since
+        # point 34). It intermittently spends its whole output budget on
+        # reasoning tokens and returns empty content, which fails the
+        # adjudication validation (it must return a decision for every candidate
+        # pair). 4096 was not enough headroom; measured reasoning runs reached
+        # 4091 tokens. Keep a large budget so reasoning + JSON both fit.
         cross_window_adjudication: 16384
       window_planner:
         mode: model

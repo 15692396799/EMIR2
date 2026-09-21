@@ -3733,6 +3733,72 @@ class BailianConfigTests(unittest.TestCase):
         self.assertNotIn("OLLAMA_EMBED_ENDPOINT", runner_env)
 
 
+class EvalLargeMemoryArmTests(unittest.TestCase):
+    """The two eval_large memory arms differ only in the memory model.
+
+    The arms exist to isolate one variable: memory construction on
+    openai/gpt-4o-mini (cheap) versus Bailian's glm-5.1 (the 2026-09-19/20
+    runs), with answering, judging, the Ollama lanes, the retrieval stack and
+    the prompts held identical.
+    """
+
+    ARMS = ("eval_large_mem_glm51.yaml", "eval_large_mem_gpt4omini.yaml")
+
+    def _load(self, name):
+        import importlib
+
+        import yaml
+
+        importlib.reload(runtime)
+        path = EXPERIMENT_DIR / "configs" / name
+        return (
+            yaml.safe_load(path.read_text(encoding="utf-8")),
+            runtime.load_memory_config(path),
+        )
+
+    def test_arms_differ_only_in_the_memory_model(self):
+        import copy
+
+        left, _ = self._load(self.ARMS[0])
+        right, _ = self._load(self.ARMS[1])
+        left = copy.deepcopy(left)
+        right = copy.deepcopy(right)
+        for data in (left, right):
+            # adjudication_model is a YAML alias of memory_builder, so the
+            # adjudicator follows the arm's memory model by construction.
+            data["models"].pop("memory_builder")
+            data["models"].pop("adjudication_model")
+            data["memory"]["backends"]["v4"]["prompt_output_tokens"].pop("memory_builder")
+        self.assertEqual(left, right)
+
+    def test_each_arm_names_its_memory_model(self):
+        from run_experiment import model_summary
+
+        _, glm = self._load(self.ARMS[0])
+        _, mini = self._load(self.ARMS[1])
+        glm_models = model_summary(glm)
+        mini_models = model_summary(mini)
+        self.assertEqual(glm_models["memory_builder"], "dashscope_bailian/glm-5.1")
+        self.assertEqual(glm_models["adjudication_model"], "dashscope_bailian/glm-5.1")
+        self.assertEqual(mini_models["memory_builder"], "openrouter/openai/gpt-4o-mini")
+        self.assertEqual(
+            mini_models["adjudication_model"], "openrouter/openai/gpt-4o-mini"
+        )
+        for role in ("answer_model", "judge_model", "embedding", "controller"):
+            self.assertEqual(glm_models[role], mini_models[role], role)
+
+    def test_the_default_name_is_the_glm51_arm(self):
+        default, _ = self._load("eval_large.yaml")
+        glm, _ = self._load(self.ARMS[0])
+        self.assertEqual(
+            default["models"]["memory_builder"], glm["models"]["memory_builder"]
+        )
+        self.assertEqual(
+            default["memory"]["backends"]["v4"]["prompt_output_tokens"],
+            glm["memory"]["backends"]["v4"]["prompt_output_tokens"],
+        )
+
+
 class RunSummaryTests(unittest.TestCase):
     """The batch launcher must not carry printf-style `%` into cmd.exe."""
 

@@ -1,61 +1,62 @@
-# Point 11/13/33/34: large-model config for the real Table 3 scores.
+# Point 11/13/33/36: memory-model arm A (gpt-4o-mini) of the eval_large pair.
 #
-# This file is memory-model arm B of the eval_large pair (Bailian glm-5.1) under
-# the default name, so the existing commands, tools and scripts keep working.
-# The pair, and the one place where it differs, is documented in
-#   configs/eval_large_mem_glm51.yaml      (this arm)
-#   configs/eval_large_mem_gpt4omini.yaml  (the cheap arm)
-# Keep all three files in sync; the offline test suite asserts that the two arms
-# differ only in `models.memory_builder` and
-# `prompt_output_tokens.memory_builder`.
+# The pair differs in exactly one place -- the memory-construction model:
+#   * eval_large_mem_gpt4omini.yaml   (this file): OpenRouter openai/gpt-4o-mini
+#   * eval_large_mem_glm51.yaml                 : Bailian dashscope_bailian/glm-5.1
+# Everything else (answering and judging on openai/gpt-5-mini, the six Ollama
+# lanes, the retrieval stack, the prompts) is identical, so running both arms
+# isolates the memory model. Keep the two files in sync apart from
+# `models.memory_builder` and `prompt_output_tokens.memory_builder`; the offline
+# test suite asserts the rest stays byte-identical.
 #
 # Role split (documented so the run is reproducible):
 #   * embedding / controller / window_planner / entity_judge / decomposition_gate
 #     / slm -> the GPU server's Ollama, with exactly the models upstream
 #     `default.yaml` specifies (qwen3-embedding, qwen3.5:latest). No substitution.
-#   * memory_builder / adjudication / semantic_reducer -> Bailian (DashScope)
-#     glm-5.1 (point 34/35: back from openai/gpt-4o-mini, which point 33 had put
-#     here, and served by Bailian rather than OpenRouter's z-ai/glm-5.1). The
-#     reducer follows memory_builder because `semantic_state_model` is null, so
-#     this one block moves the whole memory construction side.
+#   * memory_builder / adjudication / semantic_reducer -> OpenRouter
+#     openai/gpt-4o-mini (the point-33 memory model). The reducer follows
+#     memory_builder because `semantic_state_model` is null, so this one block
+#     moves the whole memory construction side.
 #   * answer_model / judge_model -> OpenRouter openai/gpt-5-mini (point 33: the
 #     answering role moved off z-ai/glm-5.1 and the judge off
 #     openai/gpt-4o-mini).
 #
 # Two constraints to keep in mind:
-#   * glm-5.1 is a reasoning model, so both memory roles need a real output
-#     budget: `prompt_output_tokens.memory_builder` is 32768 and
-#     `cross_window_adjudication` is 16384 (4096 was not enough; measured
-#     reasoning runs reached 4091 tokens and the JSON arrived truncated).
+#   * gpt-4o-mini caps completions at 16,384 tokens, so
+#     `prompt_output_tokens.memory_builder` is 16384 -- the provider rejects the
+#     32768 that upstream uses with glm-5.1. A session whose extraction JSON
+#     needs more is truncated and fails validation, so watch
+#     Ingest.Retried_After_Validation_Error in sessions.jsonl.
+#   * `cross_window_adjudication` stays 16384 even though gpt-4o-mini spends
+#     none of it on reasoning (the value is shared with the glm-5.1 arm, which
+#     needs it: measured reasoning runs reached 4091 tokens and the JSON arrived
+#     truncated at 4096).
 #   * gpt-5-mini is a reasoning model, so both roles that use it need a real
 #     output budget and a longer timeout than the models they replaced (see
 #     answer_model / judge_model below).
 #
-# Why glm-5.1 came back (point 34): with gpt-4o-mini on the memory side, the
-# reducer answered with `evidence_event_refs` from other windows, upstream
-# rejected it with "semantic operation references evidence outside supplied
-# local event refs", the checkpoint guard invalidated the namespace and re-ran
-# the session, and at temperature 0.0 the re-run reproduced the same answer --
-# shard_1 persona 3c2e5fe5 died on session 6 that way. Every store on disk
-# agrees: zero hits in the glm-5.1 runs of 2026-09-19/20, hits within minutes
-# in both gpt-4o-mini runs of 2026-09-21. The reducer guard stays installed as a
-# safety net for the other configurations.
-#
-# Why Bailian rather than OpenRouter (point 35): Bailian serves the same glm-5.1
-# without OpenRouter's markup, and it is the provider the 2026-09-19/20 shard
-# runs used, so the memory side stays comparable with them. Only the answering
-# and judging roles stay on OpenRouter.
+# What to watch in this arm (point 36): gpt-4o-mini is the cheaper memory
+# model, but it is weaker at keeping the reducer's refs inside the supplied
+# window. Measured on 2026-09-21: the glm-5.1 runs of 2026-09-19/20 have zero
+# "semantic operation references evidence outside supplied local event refs"
+# hits across every store on disk, while both gpt-4o-mini runs hit it within
+# minutes -- shard_1 persona 3c2e5fe5 died on session 6 that way (the checkpoint
+# guard re-runs the session, and at temperature 0.0 the re-run reproduces the
+# same answer, so the persona's budget runs out). memconflict_eval/reducer_guard.py
+# drops the unresolvable refs instead, so the failure is repaired rather than
+# fatal in both arms; count Ingest.Retried_After_Validation_Error when comparing
+# the two arms.
 #
 # Reach the Ollama roles through the SSH tunnel first:
 #   ssh -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa \
 #       -N -L 41135:127.0.0.1:41135 tx@172.26.4.254
 #
-#   python Experiment/run_experiment.py --config Experiment/configs/eval_large.yaml
+#   python Experiment/run_experiment.py --config Experiment/configs/eval_large_mem_gpt4omini.yaml
 #
 # Requires in Experiment/.env:
-#   DASHSCOPE_API_KEY, DASHSCOPE_CHAT_COMPLETIONS_ENDPOINT   (memory side)
-#   OPENROUTER_API_KEY, OPENROUTER_CHAT_COMPLETIONS_ENDPOINT (answer + judge)
+#   OPENROUTER_API_KEY, OPENROUTER_CHAT_COMPLETIONS_ENDPOINT (every cloud role)
 #   OLLAMA_BASE_URL / OLLAMA_BASE_URLS                       (the six lanes)
+# No DASHSCOPE_*: no role of this arm comes from Bailian.
 #
 # Verify the two channels before a long run (Bailian renames third-party models,
 # so the id `glm-5.1` must be what the account actually serves):
@@ -69,25 +70,26 @@ models:
     model: qwen3-embedding
     base_url_env: OLLAMA_BASE_URL
     timeout: 600
-  # Point 34/35: memory construction runs on Bailian's glm-5.1 (DashScope), the
-  # model and provider the 2026-09-19/20 shard runs used; point 33 had moved it
-  # to openai/gpt-4o-mini, see the header for why it came back. The reducer
-  # inherits this block through `semantic_state_model: null`, so the whole memory
-  # side is Bailian glm-5.1. No OpenRouter `provider:` routing here: that key is
-  # an OpenRouter request field and Bailian rejects unknown body fields. The
-  # client sends `enable_thinking: false` for provider `dashscope_bailian`
-  # (Retrival-Mem memory/clients.py).
-  # The builder's real limit comes from prompt_output_tokens.memory_builder
-  # below (32768); extra_body.max_tokens is the provider-side ceiling.
+  # Point 33/36: memory construction runs on openai/gpt-4o-mini, the cheap arm
+  # of the pair. The reducer inherits this block through `semantic_state_model:
+  # null`, so the whole memory construction side follows it. The builder's real
+  # limit comes from prompt_output_tokens.memory_builder below (16384);
+  # extra_body.max_tokens is the provider-side ceiling.
   memory_builder: &memory_chat
-    provider: dashscope_bailian
-    model: glm-5.1
-    api_key_env: DASHSCOPE_API_KEY
-    chat_completions_endpoint_env: DASHSCOPE_CHAT_COMPLETIONS_ENDPOINT
+    provider: openrouter
+    model: openai/gpt-4o-mini
+    api_key_env: OPENROUTER_API_KEY
+    chat_completions_endpoint_env: OPENROUTER_CHAT_COMPLETIONS_ENDPOINT
     temperature: 0.0
     timeout: 300
     extra_body:
-      max_tokens: 32768
+      max_tokens: 16384
+      # gpt-4o-mini is served by OpenRouter's OpenAI and Azure endpoints; both
+      # are the same model, so a momentary geo-403 on OpenAI's endpoint does not
+      # kill a persona's ingest. allow_fallbacks keeps a long run alive.
+      provider:
+        order: ["OpenAI", "Azure"]
+        allow_fallbacks: true
   adjudication_model: *memory_chat
   # Point 33: answering and judging both run on openai/gpt-5-mini -- one block,
   # because they are the same model on the same lane (the judge additionally
@@ -150,12 +152,12 @@ memory:
       # See smoke_small.yaml: the upstream 8192 default is sized for LoCoMo and
       # truncates MemConflict extractions.
       prompt_output_tokens:
-        # Point 34: glm-5.1 is a reasoning model, so the extraction JSON shares
-        # this budget with its reasoning tokens. 32768 is what upstream
-        # `default.yaml` uses for the same model; shortening it truncates the
-        # JSON and fails validation, so watch
-        # Ingest.Retried_After_Validation_Error in sessions.jsonl.
-        memory_builder: 32768
+        # gpt-4o-mini caps completions at 16384 tokens; 32768 (the glm-5.1 arm's
+        # value) is rejected by the provider as an invalid max_tokens. 16384 is
+        # therefore both the headroom and the ceiling -- a session whose
+        # extraction JSON needs more will be truncated and fail validation, so
+        # watch Ingest.Retried_After_Validation_Error in sessions.jsonl.
+        memory_builder: 16384
         semantic_reducer: 8192
         window_boundary: 512
         entity_judge: 2048

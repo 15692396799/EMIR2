@@ -425,6 +425,45 @@ What makes this work:
   to `--ollama-units`, round robin); the merged tables are refreshed one shard at
   a time under a lock, and `run_meta.json` records the container each shard used.
 
+### The two memory-model arms (eval_large)
+
+`eval_large.yaml` exists twice, because the memory-construction model is the one
+variable these two runs are meant to isolate:
+
+| Config | memory_builder / adjudication / semantic_reducer | answer / judge | .env needs |
+| --- | --- | --- | --- |
+| `configs/eval_large_mem_glm51.yaml` (= `configs/eval_large.yaml`) | Bailian `dashscope_bailian/glm-5.1` | OpenRouter `openai/gpt-5-mini` | `DASHSCOPE_*` + `OPENROUTER_*` |
+| `configs/eval_large_mem_gpt4omini.yaml` | OpenRouter `openai/gpt-4o-mini` | OpenRouter `openai/gpt-5-mini` | `OPENROUTER_*` |
+
+Everything else -- answering, judging, the six Ollama lanes, the retrieval
+stack, the prompts -- is identical, and an offline test asserts that the two
+files differ only in `models.memory_builder`, its YAML alias
+`adjudication_model`, and `prompt_output_tokens.memory_builder` (16384 for
+gpt-4o-mini, whose completion cap that is; 32768 for glm-5.1, which spends part
+of it on reasoning). `eval_large.yaml` is the glm-5.1 arm under the default
+name, so the existing commands, tools and scripts keep working.
+
+Run the arms into **separate output directories** and never merge them into one
+table:
+
+```powershell
+python -u Experiment\run_experiment.py --config Experiment\configs\eval_large_mem_glm51.yaml `
+  --persona-indices 0,4,18,27,28 --persona-workers 10 --output-dir Experiment\runs\shard_1_glm51
+python -u Experiment\run_experiment.py --config Experiment\configs\eval_large_mem_gpt4omini.yaml `
+  --persona-indices 0,4,18,27,28 --persona-workers 10 --output-dir Experiment\runs\shard_1_mini
+```
+
+What to compare: the tables, plus `Ingest.Retried_After_Validation_Error` in
+`sessions.jsonl`. The gpt-4o-mini arm is the one that trips the reducer's ref
+validation (zero hits in the glm-5.1 runs of 2026-09-19/20, hits within minutes
+in both gpt-4o-mini runs of 2026-09-21); the reducer guard repairs it, so the
+cost shows up as re-run sessions rather than as a failed persona.
+
+```powershell
+python Experiment\tools\check_channels.py --config Experiment\configs\eval_large_mem_glm51.yaml --roles memory_builder,adjudication_model
+python Experiment\tools\check_channels.py --config Experiment\configs\eval_large_mem_gpt4omini.yaml --roles memory_builder,adjudication_model
+```
+
 ### Full-scale sharding
 
 The full benchmark is 30 personas / 1,579 sessions / 3,750 questions, which is

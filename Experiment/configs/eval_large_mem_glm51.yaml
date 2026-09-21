@@ -1,13 +1,16 @@
-# Point 11/13/33/34: large-model config for the real Table 3 scores.
+# Point 11/13/33/34/36: memory-model arm B (glm-5.1) of the eval_large pair.
 #
-# This file is memory-model arm B of the eval_large pair (Bailian glm-5.1) under
-# the default name, so the existing commands, tools and scripts keep working.
-# The pair, and the one place where it differs, is documented in
-#   configs/eval_large_mem_glm51.yaml      (this arm)
-#   configs/eval_large_mem_gpt4omini.yaml  (the cheap arm)
-# Keep all three files in sync; the offline test suite asserts that the two arms
-# differ only in `models.memory_builder` and
-# `prompt_output_tokens.memory_builder`.
+# The pair differs in exactly one place -- the memory-construction model:
+#   * eval_large_mem_glm51.yaml      (this file): Bailian dashscope_bailian/glm-5.1
+#   * eval_large_mem_gpt4omini.yaml            : OpenRouter openai/gpt-4o-mini
+# Everything else (answering and judging on openai/gpt-5-mini, the six Ollama
+# lanes, the retrieval stack, the prompts) is identical, so running both arms
+# isolates the memory model. Keep the two files in sync apart from
+# `models.memory_builder` and `prompt_output_tokens.memory_builder`; the offline
+# test suite asserts the rest stays byte-identical.
+#
+# eval_large.yaml is this same arm under the default name, kept so the existing
+# commands, tools and scripts keep working.
 #
 # Role split (documented so the run is reproducible):
 #   * embedding / controller / window_planner / entity_judge / decomposition_gate

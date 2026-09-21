@@ -34,6 +34,7 @@
 34. debug：陈旧缓存保护警告；提高重试次数
 35. debug：`openai/gpt-5-mini`，这个 endpoint 强制要求推理
 36. debug：由于更换了更便宜的模型导致按窗口抽事件的越界
+37. debug：gpt-4o-mini的速度显然更快
 
 ```
 

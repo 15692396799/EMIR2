@@ -35,17 +35,16 @@
 #     output budget and a longer timeout than the models they replaced (see
 #     answer_model / judge_model below).
 #
-# What to watch in this arm (point 36): gpt-4o-mini is the cheaper memory
-# model, but it is weaker at keeping the reducer's refs inside the supplied
-# window. Measured on 2026-09-21: the glm-5.1 runs of 2026-09-19/20 have zero
-# "semantic operation references evidence outside supplied local event refs"
-# hits across every store on disk, while both gpt-4o-mini runs hit it within
-# minutes -- shard_1 persona 3c2e5fe5 died on session 6 that way (the checkpoint
-# guard re-runs the session, and at temperature 0.0 the re-run reproduces the
-# same answer, so the persona's budget runs out). memconflict_eval/reducer_guard.py
-# drops the unresolvable refs instead, so the failure is repaired rather than
-# fatal in both arms; count Ingest.Retried_After_Validation_Error when comparing
-# the two arms.
+# What to watch in this arm (point 36): this is the cheaper memory model. The
+# reducer's ref validation used to look like its weak spot -- one 2026-09-21
+# session died on "semantic operation references evidence outside supplied local
+# event refs" -- but the measurement over every store's API logs makes it a rare
+# hallucination in both arms (~0.1% of reducer calls: 1/1,391 and 2/1,285 in the
+# glm-5.1 arms, 0/104 here), not a property of gpt-4o-mini. Both guards are
+# installed: the reducer ref guard repairs an answer that cites an unresolvable
+# ref, and the strict-schema guard (point 37) constrains the OpenAI-family lanes
+# to the window's refs. Count Ingest.Retried_After_Validation_Error and the wall
+# clock when comparing the two arms.
 #
 # Reach the Ollama roles through the SSH tunnel first:
 #   ssh -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa \

@@ -99,16 +99,19 @@ def import_retrival_mem(root: Path | None = None):
 
     from .openrouter_reasoning import install_reasoning_guard
     from .reducer_guard import install_reducer_guard
+    from .strict_schema_guard import install_strict_schema_guard
 
     # The checkout stays read-only, so a request shape the provider rejects and
     # a reducer answer that cites another window's refs are repaired here
-    # instead (see the module docstrings of the two guards). The reasoning guard
-    # is needed by the point-33 model config (gpt-5-mini rejects "no thinking");
-    # the reducer guard keeps evidence_event_refs inside the window's
-    # local_event_refs, which is what the checkpoint guard otherwise repairs by
-    # recomputing the whole session (and which eventually kills the persona).
+    # instead (see the module docstrings of the guards). The reasoning guard is
+    # needed by the point-33 model config (gpt-5-mini rejects "no thinking");
+    # the strict-schema guard asks the OpenAI-family lanes for a reducer answer
+    # whose evidence refs are an enum of the window's refs, so an out-of-window
+    # ref cannot be generated at all; the reducer guard stays as the safety net
+    # for the lanes without strict structured outputs (Bailian, Ollama).
     install_reasoning_guard()
     install_reducer_guard()
+    install_strict_schema_guard()
 
     return SimpleNamespace(
         MemorySystem=MemorySystem,

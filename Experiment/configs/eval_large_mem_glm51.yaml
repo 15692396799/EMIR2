@@ -40,9 +40,14 @@
 # local event refs", the checkpoint guard invalidated the namespace and re-ran
 # the session, and at temperature 0.0 the re-run reproduced the same answer --
 # shard_1 persona 3c2e5fe5 died on session 6 that way. Every store on disk
-# agrees: zero hits in the glm-5.1 runs of 2026-09-19/20, hits within minutes
-# in both gpt-4o-mini runs of 2026-09-21. The reducer guard stays installed as a
-# safety net for the other configurations.
+# agrees that it is rare rather than model-specific: it happens in ~0.1% of the
+# reducer calls (1/1,391 and 2/1,285 in the glm-5.1 arms of 2026-09-19/20,
+# 0/104 in the gpt-4o-mini arm of 2026-09-21), the request never advertises a
+# bad ref itself (0/2,873) and the extraction never cites an out-of-window turn
+# id (0/16,700 items). One hit still costs a whole session re-run, so both
+# guards stay: the reducer ref guard repairs the answer, and the strict-schema
+# guard (point 37) asks the OpenAI-family lanes to answer under a JSON schema
+# whose evidence refs are an enum of the window's refs.
 #
 # Why Bailian rather than OpenRouter (point 35): Bailian serves the same glm-5.1
 # without OpenRouter's markup, and it is the provider the 2026-09-19/20 shard

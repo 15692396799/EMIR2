@@ -286,11 +286,14 @@ the session, and the persona dies once that budget is spent -- session 0 of a
 fresh run shows it immediately, because nothing stale is involved, which is what
 makes the `[warn] ... retrying once` line look wrong there.
 
-This is the failure the point-33 model split made common: it happens with
-`memory_builder = openai/gpt-4o-mini` (weaker at keeping its refs inside the
-supplied window) and did not happen in the glm-5.1 runs of 2026-09-19/20
-(0 hits across every store on disk; the two gpt-4o-mini runs of 2026-09-21 hit
-it within minutes -- see the per-run table in the run notes).
+How often it actually happens (measured 2026-09-21 over the API logs of every
+store on disk): the request never advertises an unresolvable ref (0 of 2,873
+calls), the extraction never cites an out-of-window turn id (0 of 16,700
+extracted items), but the *reducer answer* cites a ref outside the window in
+about 0.1% of the calls -- 1 of 1,391 and 2 of 1,285 in the glm-5.1 arms, 0 of
+104 in the gpt-4o-mini arm. Rare, but each hit costs a whole session re-run (and
+a persona once the retry reproduces it), because `temperature: 0.0` makes the
+feedback retry return the same answer.
 
 `_apply_reducer_update` resolves every cited ref through `event_refs` and
 silently drops the ones that miss, so an unresolvable ref cannot contribute
@@ -300,6 +303,29 @@ exactly those refs: the request stops advertising an unresolvable trigger, and
 is still recorded, with the refs that do resolve). Extraction, adjudication,
 planner and entity-judge calls are never touched, a legal answer is returned
 byte for byte, and `MEMCONFLICT_REDUCER_GUARD=0` restores upstream behaviour.
+
+### Strict structured output for the reducer
+
+The ref guard repairs an out-of-window ref after the fact; this guard makes one
+impossible to produce. On the OpenAI-family lanes (`openrouter`, `openai`,
+`azure`) the reducer request is sent as an OpenAI structured-output request
+(`response_format: {"type": "json_schema", "json_schema": {"strict": true, ...}}`)
+whose `operations[].evidence_event_refs.items` is an `enum` of the refs the
+request itself advertises (`local_event_refs`).
+`memconflict_eval/strict_schema_guard.py` builds that schema from the payload's
+own `output_schema`: `oneOf` becomes `anyOf`, the keywords strict mode rejects
+(`minItems`, `uniqueItems`, `minLength`, `minimum`, ...) are dropped, the one
+unconstrained slot (`operations[].value`) is typed, and every property is made
+required with `additionalProperties: false`. Only reducer requests are touched
+(detected by their payload shape), every other call keeps the upstream
+`json_object` body byte for byte, and Bailian/Ollama lanes are untouched (their
+APIs do not implement this shape -- the ref guard stays their safety net).
+`MEMCONFLICT_STRICT_SCHEMA_GUARD=0` switches the patch off.
+
+Verified against the live lane on 2026-09-21: a payload that *instructs* the
+model to cite `ev_9`, a ref outside the enum, answered with
+`evidence_event_refs: ["ev_1", "ev_2"]` (and `["ev_1"]` through the patched
+client), i.e. the provider's constrained decoding refused the foreign ref.
 
 ### The OpenRouter reasoning guard
 

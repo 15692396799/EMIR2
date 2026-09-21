@@ -79,65 +79,6 @@ python Experiment\run_experiment.py
 python Experiment\run_scoring.py --run-dir Experiment\runs\<timestamp>
 ```
 
-### Point 33: which model does what
-
-| Role | Model | Provider |
-| --- | --- | --- |
-| `memory_builder`, `adjudication_model` | `openai/gpt-4o-mini` | OpenRouter |
-| `answer_model` | `openai/gpt-5-mini` | OpenRouter |
-| `judge_model` | `openai/gpt-5-mini` | OpenRouter |
-| `embedding` | `qwen3-embedding` | GPU server's Ollama |
-| `controller`, `window_planner`, `entity_judge`, `decomposition_gate`, `slm` | `qwen3.5:latest` | GPU server's Ollama |
-
-Point 33 moved all three cloud roles: memory construction left `z-ai/glm-5.1`
-for `openai/gpt-4o-mini`, and both the answering role (was `z-ai/glm-5.1`) and
-the judge (was `openai/gpt-4o-mini`) now run on `openai/gpt-5-mini`. Note what
-that means for the artefacts already on disk: the pre-point-33 shards answered
-with `z-ai/glm-5.1`, so their AA is not comparable with a post-point-33 run --
-the answers themselves change, not just the grading. Re-run a shard before
-mixing the two in one table (`merge_shards.py` warns, `run_meta.json` records
-the roles).
-
-`configs/eval_large_bailian*.yaml` follow the same roles. Bailian serves no
-OpenAI model, so `eval_large_bailian.yaml` has no Bailian role left and is now
-role-identical to `eval_large.yaml` (kept because the shard commands and the
-chain state refer to that name); `eval_large_bailian_all.yaml` still exists for
-a host with no campus network, but it now needs `OPENROUTER_*` for the builder,
-the answerer *and* the judge, and only its embedding / control roles come from
-Bailian.
-
-Two consequences of the swap:
-
-* `prompt_output_tokens.memory_builder` is 16384, not upstream's 32768:
-  gpt-4o-mini caps completions at 16384 tokens and the provider rejects the
-  larger value as an invalid `max_tokens`. The V4 extraction JSON is large, so a
-  session that needs more than 16384 output tokens is truncated and fails
-  validation -- watch `Ingest.Retried_After_Validation_Error` in
-  `sessions.jsonl` on the first run with the new builder.
-* Both gpt-5-mini roles are reasoning models now: 8192 output tokens and a 300 s
-  timeout instead of the budgets that were sized for gpt-4o-mini (512 tokens)
-  and for glm-5.1. A small budget on a reasoning model can be spent entirely on
-  reasoning tokens and return empty content: `MemConflictAnswerer` raises
-  `EmptyAnswerError` for a blank completion (recorded as `Answer_Error` on the
-  question row, `Answer_Error_Count` in `metrics.json`) instead of storing a
-  blank answer that AA would quietly count as wrong, and
-  `MemConflictJudge` records a `Judge_Error` the same way. Neither is retried,
-  and gpt-5-mini only accepts the default temperature (1.0, set in the config).
-  The upstream client also always disables thinking
-  (`reasoning: {enabled: false, effort: none}` for OpenRouter, from
-  `Retrival-Mem`'s `disable_request_thinking`). OpenAI's gpt-5-mini endpoint
-  answers that with `400 Reasoning is mandatory for this endpoint and cannot be
-  disabled`, which is not a transient error: measured on 2026-09-21 both live
-  shards recorded `Answer_Error` for every single question (9/9 and 12/12).
-  `memconflict_eval/openrouter_reasoning.py` now rewrites that field for the
-  reasoning-mandatory models into `reasoning: {effort: minimal}` (measured: 200
-  with `minimal`, `low` or no field at all), and
-  `MEMCONFLICT_REASONING_EFFORT` / `MEMCONFLICT_REASONING_GUARD=0` tune or
-  restore the upstream shape. Everything else keeps the upstream request
-  unchanged. `check_channels.py --roles answer_model,judge_model` is still the
-  one-second preflight for the lane; score with `configs/eval_large_dsjudge.yaml`
-  if the judge lane is down for another reason.
-
 ### Points 16 + 17: several GPUs, several personas at once
 
 The GPU server runs one Ollama container per GPU, each publishing its own host
@@ -148,15 +89,15 @@ if one is down (`--allow-missing-units` runs on the rest instead).
 
 | Host port | Container | GPU | Status (probed 2026-09-21) |
 | --- | --- | --- | --- |
-| 41137 | `ollama021-3-1` | device2 | new lane -- start it |
-| 41138 | `ollama021-3-2` | device3 | new lane -- start it |
-| 41133 | `ollama021-2-1` | device4 | GPU, 8.72 GB vram, 94.1 tok/s |
-| 41134 | `ollama021-2-2` | device5 | **not running -- start it** |
-| 41135 | `ollama021-1` | device6 | GPU, 8.72 GB vram, 48.2 tok/s while the live shards use it |
-| 41136 | `ollama021` | device7 | GPU, 8.72 GB vram, 94.5 tok/s |
+| 41137 | `ollama021-3-1` | device2 | GPU, 8.72 GB vram, 103.4 tok/s |
+| 41138 | `ollama021-3-2` | device3 | GPU, 8.72 GB vram, 99.6 tok/s |
+| 41133 | `ollama021-2-1` | device4 | GPU, 8.72 GB vram, 104.7 tok/s |
+| 41134 | `ollama021-2-2` | device5 | GPU, 8.72 GB vram, 100.4 tok/s |
+| 41135 | `ollama021-1` | device6 | GPU, 8.72 GB vram, 103.1 tok/s |
+| 41136 | `ollama021` | device7 | GPU, 8.72 GB vram, 104.7 tok/s |
 
-Start the missing containers on the GPU server (same shape as `ollama021-1`, and
-idempotent):
+Start a missing container on the GPU server (same shape as `ollama021-1`, and
+idempotent). Host ports 41137/41138 were free when this was written:
 
 ```bash
 docker run -d --name ollama021-3-1 --gpus '"device=2"' -p 0.0.0.0:41137:11434 \
@@ -172,11 +113,6 @@ docker run -d --name ollama021 --gpus '"device=7"' -p 0.0.0.0:41136:11434 \
   -v /data/ollama_models:/root/.ollama/models -e OLLAMA_CONTEXT_LENGTH=32768 \
   --restart unless-stopped ollama/ollama:0.21
 ```
-
-One container per GPU keeps the GPUs independent: a lane is only as fast as its
-own card, and a container that crashes takes only its own workers down. Host
-ports 41137/41138 were free when this was written (`41133`-`41136` are the
-older lanes).
 
 `Experiment/tools/ollama_containers.sh status` lists what runs where, and
 `Experiment/tools/ollama_containers.sh start` (re)creates the missing ones.
@@ -199,7 +135,7 @@ python Experiment\run_experiment.py --persona-workers 6 `
 # Two personas per container (more requests in flight per GPU; watch tok/s).
 python Experiment\run_experiment.py --persona-workers 12
 
-# Keep going while device5/2/3 come up: drop the dead lanes and use the rest.
+# Keep going while a container restarts: drop the dead lanes and use the rest.
 python Experiment\run_experiment.py --persona-workers 6 --allow-missing-units
 ```
 
@@ -329,36 +265,6 @@ checkout:
 * `MEMCONFLICT_CHECKPOINT_GUARD=0` turns the guard off (the raw upstream
   behaviour, useful when comparing against an unguarded run).
 
-### The semantic reducer ref guard
-
-The reducer prompt hands the model two ref lists: `event.trigger_event_ref` (the
-event the claim came from, copied out of the extraction answer) and
-`local_event_refs` (the events extracted in *this* window). Upstream validates
-the answer against the second list only, so a claim whose trigger was extracted
-in another window advertises a ref the answer may not cite; a model that cites
-the ref the prompt itself handed it is rejected with
-`semantic operation references evidence outside supplied local event refs`.
-Because the reducer role runs at `temperature: 0.0`, the retry produces the same
-answer: the checkpoint guard invalidates the stage's six cached units, re-runs
-the session, and the persona dies when the budget is spent -- and session 0 of a
-fresh run shows it immediately, because nothing stale is involved, which is what
-makes that `[warn]` look wrong there.
-
-Measured on 2026-09-21 over the API logs of every finished store: 47 of 3,912
-reducer answers cited a ref outside `local_event_refs`; shard_1 session 0 of
-`a7850e51` is the smallest example (`trigger_event_ref: turn_17`, while
-`local_event_refs` lists `turn_1, turn_3, turn_5, turn_7, turn_9, turn_11,
-turn_13, turn_18, turn_40, turn_80`). `_apply_reducer_update` resolves every
-cited ref through `event_refs` and silently drops the ones that miss, so an
-unresolvable ref cannot contribute anything to memory in the first place.
-
-`memconflict_eval/reducer_guard.py` therefore drops exactly those refs: the
-request stops advertising an unresolvable trigger, and
-`evidence_event_refs` that cannot resolve are removed from the answer (the fact
-is still recorded, with the refs that do resolve). Extraction, adjudication,
-planner and entity-judge calls are never touched, a legal answer is returned
-byte for byte, and `MEMCONFLICT_REDUCER_GUARD=0` restores upstream behaviour.
-
 ### Interrupted runs: resume, and never lose finished work
 
 * `results.jsonl` is written the moment a persona finishes (P0-1). The dataset
@@ -433,13 +339,10 @@ What makes this work:
   one of the six shards.
 * Two configs are available for the shards:
   `configs/eval_large_bailian.yaml` keeps the control roles and embeddings on
-  the campus Ollama (after point 33 no role comes from Bailian at all: memory
-  construction is `openai/gpt-4o-mini`, answering and judging are
-  `openai/gpt-5-mini`, all on OpenRouter, exactly as in `eval_large.yaml`), while
-  `configs/eval_large_bailian_all.yaml` moves every role the campus Ollama
-  would otherwise serve to Bailian, so a host with no campus network can run a
-  shard (it needs `DASHSCOPE_*` plus `OPENROUTER_*` for the builder, the answerer
-  and the judge). The two are different systems: swapping the
+  the campus Ollama (GLM already comes from Bailian), while
+  `configs/eval_large_bailian_all.yaml` moves **every** role to Bailian so a
+  host with no campus network can run a shard (`check_channels.py` shows it
+  needs only `DASHSCOPE_*`). The two are different systems: swapping the
   embedding model changes the retrieval rankings, so all shards of one merged
   table must use the same config. `run_experiment.py --resume` refuses to
   continue a store when `run_meta.json` records different models (override with
@@ -461,12 +364,11 @@ What makes this work:
   ```
 
   When several shards run at once (three terminals, or `--parallel`), give each
-  shard its own GPU container so the Ollama queues stay separate (one container
-  can also be shared by two shards, but then the two queues compete again):
+  shard its own GPU container so the Ollama queues stay separate:
 
   ```powershell
-  python Experiment\tools\run_shards_chain.py --parallel 4 --persona-workers 1 `
-    --units-map "shard_1=http://172.26.94.12:41135;shard_2=http://172.26.94.12:41136;shard_3=http://172.26.94.12:41133;shard_4=http://172.26.94.12:41134"
+  python Experiment\tools\run_shards_chain.py --parallel 3 `
+    --units-map "shard_1=http://172.26.94.12:41135;shard_2=http://172.26.94.12:41133;shard_3=http://172.26.94.12:41136"
   ```
 
   `--units-map` pins one container per shard (shards without an entry fall back
@@ -520,11 +422,6 @@ Full artefacts and the failure write-ups are in
 OpenRouter `z-ai/glm-5.1` for memory building / adjudication / answering,
 `openai/gpt-4o-mini` for judging, and the GPU server's Ollama
 (`qwen3-embedding`, `qwen3.5:latest`) for embeddings and retrieval control.
-These are the pre-point-33 roles, which is what the archived artefacts were
-produced with; the current `eval_large.yaml` builds memory with
-`openai/gpt-4o-mini` and both answers and judges with `openai/gpt-5-mini`. The
-timings and costs below still hold as a shape, not as the cost of the current
-role split.
 
 ```powershell
 python Experiment\run_experiment.py --config Experiment\configs\eval_large.yaml `

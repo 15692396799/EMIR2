@@ -98,13 +98,12 @@ def import_retrival_mem(root: Path | None = None):
     )
 
     from .openrouter_reasoning import install_reasoning_guard
-    from .reducer_guard import install_reducer_guard
 
-    # The checkout stays read-only, so a request shape the provider rejects and a
-    # prompt/validator mismatch inside the reducer are repaired here instead (see
-    # the module docstrings of the two guards).
+    # The checkout stays read-only, so a request shape the provider rejects is
+    # repaired here instead (see the module docstring of the guard). Needed by
+    # the point-33 model config, where the answerer and the judge are
+    # openai/gpt-5-mini and upstream's "disable reasoning" rewrite is a 400.
     install_reasoning_guard()
-    install_reducer_guard()
 
     return SimpleNamespace(
         MemorySystem=MemorySystem,

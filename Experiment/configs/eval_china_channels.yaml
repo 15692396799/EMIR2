@@ -1,37 +1,23 @@
 # Same experiment as eval_large.yaml, but every cloud role leaves OpenRouter:
 #
-#   memory_builder / adjudication_model -> a vendor direct OpenAI-compatible
-#       channel that serves openai/gpt-4o-mini (point 33; Baidu Qianfan or
-#       Zhipu BigModel below -- both are OpenAI-compatible with Bearer auth)
-#   answer_model / judge_model -> Azure OpenAI (api-key header + deployment
-#       path), model openai/gpt-5-mini (point 33)
+#   memory_builder / adjudication_model / answer_model -> Baidu Qianfan
+#       (or Zhipu BigModel -- both are OpenAI-compatible with Bearer auth)
+#   judge_model -> Azure OpenAI (api-key header + deployment path)
 #
 # Why: OpenRouter geo-gates this machine ("This model is not available in your
-# region"), for openai/gpt-5-mini and openai/gpt-4o-mini alike, and
-# intermittently for every other model. A vendor-direct endpoint is not behind
-# that gate.
-#
-# Point 33 caveat: the memory-construction role is an OpenAI model now, so this
-# config needs a vendor channel that actually serves it. Azure OpenAI does, but
-# upstream builds the *builder* client itself and knows no `azure` provider, so
-# Azure can only carry the answerer and the judge (the two roles the experiment
-# constructs itself); point the builder at an OpenAI-compatible gateway with
-# Bearer auth (or an Azure-compatible gateway URL) instead.
+# region"), first for openai/gpt-4o-mini and intermittently for z-ai/glm-5.1.
+# A vendor-direct endpoint is not behind that gate.
 #
 # TODO fill these in Experiment/.env:
 #   QIANFAN_API_KEY / QIANFAN_CHAT_COMPLETIONS_ENDPOINT
 #   AZURE_API_KEY / AZURE_OPENAI_ENDPOINT / AZURE_OPENAI_DEPLOYMENT
 #   AZURE_OPENAI_API_VERSION (default 2024-10-21)
-# The Azure deployment must serve openai/gpt-5-mini: the answerer and the judge
-# name it explicitly with `extra.deployment`, which wins over
-# AZURE_OPENAI_DEPLOYMENT in the environment.
 #
 # Two things to check with the real keys before a long run:
-#   * the model ids the channel uses (Qianfan renames third-party models, e.g.
-#     an "ernie"/"deepseek" style id; Zhipu's own platform uses glm-4.6/glm-4.5
-#     style ids), and whether it serves openai/gpt-4o-mini at all. If it does
-#     not, point &memory_chat at the closest model and record the substitution
-#     in run_meta.
+#   * the model id the channel uses for GLM (Qianfan renames third-party models,
+#     e.g. an "ernie"/"deepseek" style id; Zhipu's own platform uses glm-4.6/
+#     glm-4.5 style ids). If GLM is not hosted there, point &large_chat at the
+#     provider's strongest model and record the substitution in run_meta.
 #   * that the endpoint tolerates the extra `enable_thinking` /
 #     `chat_template_kwargs` fields the OpenAI-compatible client sends; if it
 #     rejects them, the provider must be `azure`-style or an adapter is needed.
@@ -47,34 +33,26 @@ models:
   # `modelscope_openai_compatible` is upstream's generic Bearer-auth
   # OpenAI-compatible provider: it takes the endpoint and key from whatever env
   # names the config declares, which is exactly what a vendor direct channel is.
-  # Point 33: memory construction is openai/gpt-4o-mini.
-  memory_builder: &memory_chat
+  memory_builder: &china_chat
     provider: modelscope_openai_compatible
-    model: gpt-4o-mini
+    model: glm-5.1
     api_key_env: QIANFAN_API_KEY
     chat_completions_endpoint_env: QIANFAN_CHAT_COMPLETIONS_ENDPOINT
     temperature: 0.0
     timeout: 300
     extra_body:
-      max_tokens: 16384
-  adjudication_model: *memory_chat
-  # Point 33: the answerer and the judge are both openai/gpt-5-mini, and both
-  # go through Azure (the experiment builds these two clients itself, so the
-  # `azure` provider is available to them -- it is not to the builder).
-  answer_model: &gpt5_azure
+      max_tokens: 32768
+  adjudication_model: *china_chat
+  answer_model: *china_chat
+  judge_model:
     provider: azure
-    model: gpt-5-mini
-    # Reasoning model: default temperature only, and a real output budget so
-    # reasoning tokens cannot swallow the answer / judge JSON.
-    temperature: 1.0
-    timeout: 300
-    # deployment/api_version come from AZURE_OPENAI_* in .env unless they are
-    # given here; the client sends the api-key header and the
-    # /openai/deployments/... chat completions path.
+    model: gpt-4o-mini
+    temperature: 0.0
+    timeout: 120
+    # deployment/api_version come from AZURE_OPENAI_* in .env; the client sends
+    # the api-key header and the /openai/deployments/... chat completions path.
     extra:
-      deployment: gpt-5-mini
-      max_tokens: 8192
-  judge_model: *gpt5_azure
+      max_tokens: 512
   window_planner: &control_chat
     provider: ollama
     model: qwen3.5:latest
@@ -104,8 +82,7 @@ memory:
       entity_judge_workers: 2
       entity_auto_merge_policy: conservative
       prompt_output_tokens:
-        # gpt-4o-mini (point 33) caps completions at 16384 tokens.
-        memory_builder: 16384
+        memory_builder: 32768
         semantic_reducer: 8192
         window_boundary: 512
         entity_judge: 2048

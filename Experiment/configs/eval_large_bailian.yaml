@@ -1,30 +1,34 @@
-# Point 27 / cost: was "same experiment as eval_large.yaml, but the three
-# large-model roles come from Alibaba Bailian (DashScope) instead of OpenRouter,
-# because OpenRouter adds a fee on top of the upstream provider".
+# Point 27 / cost: same experiment as eval_large.yaml, but the three
+# large-model roles come from Alibaba Bailian (DashScope) instead of OpenRouter.
 #
-# Point 33 emptied that trade: memory construction is openai/gpt-4o-mini and
-# both answering and judging are openai/gpt-5-mini, and Bailian serves no OpenAI
-# model. No role is left on Bailian, so this file is now role-identical to
-# eval_large.yaml (and needs the same OPENROUTER_* credentials). It is kept
-# because the shard commands, the chain state and the notes refer to this name;
-# if you want a single config, delete it and point those commands at
-# eval_large.yaml.
+# Why: OpenRouter adds a fee on top of the upstream provider, and those three
+# roles carry almost all of the run's token spend (measured 2026-09-20:
+# memory_builder + adjudication + semantic_reducer = $0.081 per session).
 #
-# Role split (identical to eval_large.yaml):
-#   * memory_builder / adjudication_model -> OpenRouter openai/gpt-4o-mini.
-#   * answer_model / judge_model -> OpenRouter openai/gpt-5-mini. Use
-#     --config Experiment/configs/eval_large_dsjudge.yaml when the OpenRouter
-#     judge is geo-filtered.
+# Role split:
+#   * memory_builder / adjudication_model / answer_model -> Bailian, OpenAI
+#     compatible endpoint, `enable_thinking: false` is sent by the client for
+#     provider `dashscope_bailian` (memory/clients.py).
+#   * judge_model -> OpenRouter openai/gpt-4o-mini, unchanged: the MemConflict
+#     protocol names that judge, and its total cost is under $1 for the full
+#     benchmark. Use --config Experiment/configs/eval_large_dsjudge.yaml when
+#     the OpenRouter judge is geo-filtered.
 #   * embedding / controller / window_planner / entity_judge / decomposition_gate
 #     / slm -> the GPU server's Ollama, exactly as in eval_large.yaml.
 #
-# Before a long run, verify the channels:
+# Before a long run, verify the channel and the exact model id on Bailian:
 #
-#   python Experiment\tools\check_channels.py --config Experiment\configs\eval_large_bailian.yaml --roles memory_builder,answer_model
+#   python Experiment\tools\check_channels.py --config Experiment\configs\eval_large_bailian.yaml --roles memory_builder,answer_model,adjudication_model
 #   python Experiment\tools\check_channels.py --config Experiment\configs\eval_large_bailian.yaml --roles judge_model
 #
-# Requires in Experiment/.env: OPENROUTER_API_KEY and
-# OPENROUTER_CHAT_COMPLETIONS_ENDPOINT. No DASHSCOPE_* any more.
+# Bailian renames third-party models, so `glm-5.1` below must be the id Bailian
+# actually serves (e.g. `glm-5.1` or a vendor-prefixed id). If it differs,
+# change the one line and re-run check_channels; run_meta.json records the
+# provider/model of every role, so the substitution is on the record.
+#
+# Requires in Experiment/.env:
+#   DASHSCOPE_API_KEY, DASHSCOPE_CHAT_COMPLETIONS_ENDPOINT
+#   OPENROUTER_API_KEY, OPENROUTER_CHAT_COMPLETIONS_ENDPOINT (judge only)
 
 experiment:
   track: evaluation
@@ -34,40 +38,29 @@ models:
     model: qwen3-embedding
     base_url_env: OLLAMA_BASE_URL
     timeout: 600
-  # Point 33: memory construction is openai/gpt-4o-mini (OpenRouter), the one
-  # role in this config that Bailian cannot serve.
-  memory_builder: &memory_chat
+  memory_builder: &bailian_chat
+    provider: dashscope_bailian
+    model: glm-5.1
+    api_key_env: DASHSCOPE_API_KEY
+    chat_completions_endpoint_env: DASHSCOPE_CHAT_COMPLETIONS_ENDPOINT
+    temperature: 0.0
+    timeout: 300
+    extra_body:
+      max_tokens: 32768
+  adjudication_model: *bailian_chat
+  answer_model: *bailian_chat
+  judge_model:
     provider: openrouter
     model: openai/gpt-4o-mini
     api_key_env: OPENROUTER_API_KEY
     chat_completions_endpoint_env: OPENROUTER_CHAT_COMPLETIONS_ENDPOINT
     temperature: 0.0
-    timeout: 300
+    timeout: 120
     extra_body:
-      # gpt-4o-mini's hard completion cap; the per-stage budgets below stay
-      # inside it (prompt_output_tokens.memory_builder = 16384).
-      max_tokens: 16384
+      max_tokens: 512
       provider:
         order: ["OpenAI", "Azure"]
         allow_fallbacks: true
-  adjudication_model: *memory_chat
-  # Point 33: answering and judging are both openai/gpt-5-mini, so no role in
-  # this config comes from Bailian any more (same as eval_large.yaml).
-  answer_model: &gpt5_chat
-    provider: openrouter
-    model: openai/gpt-5-mini
-    api_key_env: OPENROUTER_API_KEY
-    chat_completions_endpoint_env: OPENROUTER_CHAT_COMPLETIONS_ENDPOINT
-    # Reasoning model: only the default temperature is accepted, and a small
-    # output budget can be eaten by reasoning tokens (empty answer / Judge_Error).
-    temperature: 1.0
-    timeout: 300
-    extra_body:
-      max_tokens: 8192
-      provider:
-        order: ["OpenAI", "Azure"]
-        allow_fallbacks: true
-  judge_model: *gpt5_chat
   window_planner: &control_chat
     provider: ollama
     model: qwen3.5:latest
@@ -97,15 +90,12 @@ memory:
       entity_judge_workers: 2
       entity_auto_merge_policy: conservative
       prompt_output_tokens:
-        # gpt-4o-mini (point 33) caps completions at 16384 tokens; 32768 is
-        # rejected as an invalid max_tokens, so this is both headroom and cap.
-        memory_builder: 16384
+        memory_builder: 32768
         semantic_reducer: 8192
         window_boundary: 512
         entity_judge: 2048
-        # Same value as eval_large.yaml: with gpt-4o-mini (point 33) the budget
-        # is pure JSON headroom -- no reasoning tokens -- and 16384 is also the
-        # model's hard completion cap.
+        # Same headroom as eval_large.yaml: the builder/adjudicator is a
+        # reasoning model and must fit reasoning tokens plus JSON in the budget.
         cross_window_adjudication: 16384
       window_planner:
         mode: model

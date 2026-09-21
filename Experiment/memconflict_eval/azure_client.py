@@ -10,14 +10,13 @@ Azure is not a drop-in for the OpenAI-compatible client used everywhere else:
 The upstream clients (which the experiment keeps read-only) always send a
 Bearer token, so this module supplies a small client of the same shape for the
 roles we construct ourselves: the answer model and the judge. It exists so the
-judge can move off OpenRouter's geo-gated OpenAI lane without touching
-``Retrival-Mem``.
+judge can move off OpenRouter's geo-gated ``openai/gpt-4o-mini`` without
+touching ``Retrival-Mem``.
 
 Configuration comes from the environment (see ``Experiment/.env.example``):
 
 * ``AZURE_OPENAI_ENDPOINT``   e.g. ``https://my-resource.openai.azure.com``
-* ``AZURE_OPENAI_DEPLOYMENT`` deployment name, e.g. ``gpt-5-mini`` (the judge
-  of point 33; the config can override it per role with ``extra.deployment``)
+* ``AZURE_OPENAI_DEPLOYMENT`` deployment name, e.g. ``gpt-4o-mini``
 * ``AZURE_OPENAI_API_VERSION`` e.g. ``2024-10-21``
 * ``AZURE_API_KEY``
 * ``AZURE_OPENAI_AUTH_HEADER`` optional, ``api-key`` (default) or

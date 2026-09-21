@@ -256,42 +256,6 @@ class AnswerPromptTests(unittest.TestCase):
             build_answer_messages("Q?", "ctx", "temporal")
 
 
-class EmptyAnswerGuardTests(unittest.TestCase):
-    """Point 33: a blank completion is an Answer_Error, not a stored answer.
-
-    The answering role is a reasoning model now, and such a model can spend its
-    whole budget on reasoning tokens and return empty content. Storing that as
-    the answer would show up as a wrong answer in AA with no trace of why.
-    """
-
-    def _answerer(self, response):
-        from memconflict_eval.answering import MemConflictAnswerer
-
-        answerer = MemConflictAnswerer.__new__(MemConflictAnswerer)
-        answerer.config = SimpleNamespace(
-            answer_model=SimpleNamespace(provider="openrouter")
-        )
-        answerer.client = _FakeChatClient(response)
-        return answerer
-
-    def test_blank_completion_raises_instead_of_storing_a_blank_answer(self):
-        from memconflict_eval.answering import EmptyAnswerError
-
-        _conflict_type, _gold, question = _sample_question()
-        for blank in (None, "", "   \n"):
-            with self.subTest(response=repr(blank)):
-                with self.assertRaises(EmptyAnswerError):
-                    self._answerer(blank).answer(question, [], memory_context="ctx")
-
-    def test_a_real_answer_is_returned_trimmed(self):
-        _conflict_type, _gold, question = _sample_question()
-        result = self._answerer("  Yes.  ").answer(
-            question, [], memory_context="ctx"
-        )
-        self.assertEqual(result.text, "Yes.")
-        self.assertEqual(result.context, "ctx")
-
-
 class JudgePromptTests(unittest.TestCase):
     def _messages(self, conflict_type="dynamic_conflict"):
         memories = [
@@ -2946,17 +2910,11 @@ class StaleCheckpointGuardTests(unittest.TestCase):
 
     def setUp(self):
         self._saved_guard = os.environ.pop("MEMCONFLICT_CHECKPOINT_GUARD", None)
-        self._saved_retries = os.environ.pop(
-            "MEMCONFLICT_CHECKPOINT_RETRIES", None
-        )
 
     def tearDown(self):
         os.environ.pop("MEMCONFLICT_CHECKPOINT_GUARD", None)
-        os.environ.pop("MEMCONFLICT_CHECKPOINT_RETRIES", None)
         if self._saved_guard is not None:
             os.environ["MEMCONFLICT_CHECKPOINT_GUARD"] = self._saved_guard
-        if self._saved_retries is not None:
-            os.environ["MEMCONFLICT_CHECKPOINT_RETRIES"] = self._saved_retries
 
     def test_checkpoints_from_an_older_scope_revision_are_dropped(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3103,83 +3061,6 @@ class StaleCheckpointGuardTests(unittest.TestCase):
                 memory.ingest_session(session)
 
         self.assertEqual(memory.system.calls, 1)
-
-    def test_the_retry_budget_re_samples_the_answer(self):
-        """MEMCONFLICT_CHECKPOINT_RETRIES decides how often the answer is redrawn."""
-
-        class AlwaysStaleSystem:
-            def __init__(self):
-                self.calls = 0
-
-            def ingest_conversation(self, namespace, conversation, metadata=None, **_k):
-                self.calls += 1
-                raise SemanticValidationError("reinforce references unknown fact key")
-
-            def is_namespace_ready(self, namespace):
-                return True
-
-        with tempfile.TemporaryDirectory() as tmp:
-            self._store(
-                tmp, revision=6, rows=[("stale", 5, "semantic_update", "succeeded")]
-            )
-            memory = self._memory(tmp)
-            memory.system = AlwaysStaleSystem()
-            os.environ["MEMCONFLICT_CHECKPOINT_RETRIES"] = "2"
-
-            with self.assertRaises(SemanticValidationError):
-                memory.ingest_session(self._session())
-
-        # One attempt plus two retries, then the budget is spent.
-        self.assertEqual(memory.system.calls, 3)
-
-    def test_zero_retries_invalidate_without_re_sampling(self):
-        class AlwaysStaleSystem:
-            def __init__(self):
-                self.calls = 0
-
-            def ingest_conversation(self, namespace, conversation, metadata=None, **_k):
-                self.calls += 1
-                raise SemanticValidationError("reinforce references unknown fact key")
-
-            def is_namespace_ready(self, namespace):
-                return True
-
-        with tempfile.TemporaryDirectory() as tmp:
-            db = self._store(
-                tmp, revision=6, rows=[("stale", 5, "semantic_update", "succeeded")]
-            )
-            memory = self._memory(tmp)
-            memory.system = AlwaysStaleSystem()
-            os.environ["MEMCONFLICT_CHECKPOINT_RETRIES"] = "0"
-
-            with self.assertRaises(SemanticValidationError):
-                memory.ingest_session(self._session())
-            statuses = self._statuses(db)
-
-        self.assertEqual(memory.system.calls, 1)
-        # The guard still marks the cache entry failed, so a --resume recomputes.
-        self.assertEqual(statuses["stale"], "failed")
-
-    def test_the_retry_budget_is_read_from_the_environment(self):
-        self.assertEqual(MemConflictMemory.checkpoint_retries(), 3)
-        os.environ["MEMCONFLICT_CHECKPOINT_RETRIES"] = "2"
-        self.assertEqual(MemConflictMemory.checkpoint_retries(), 2)
-        os.environ["MEMCONFLICT_CHECKPOINT_RETRIES"] = "99"
-        self.assertEqual(MemConflictMemory.checkpoint_retries(), 10)
-        os.environ["MEMCONFLICT_CHECKPOINT_RETRIES"] = "-4"
-        self.assertEqual(MemConflictMemory.checkpoint_retries(), 0)
-        os.environ["MEMCONFLICT_CHECKPOINT_RETRIES"] = "many"
-        self.assertEqual(MemConflictMemory.checkpoint_retries(), 3)
-
-    @staticmethod
-    def _session(session_id: int = 7):
-        return SimpleNamespace(
-            session_id=session_id,
-            date="2022-03-09",
-            session_type="chitchat",
-            dialogue=("a", "b"),
-            to_memory_session=lambda: {"session_id": str(session_id), "turns": []},
-        )
 
 
 class PersonaShardTests(unittest.TestCase):
@@ -3798,9 +3679,9 @@ class ResumeModelGuardTests(unittest.TestCase):
 
 
 class BailianConfigTests(unittest.TestCase):
-    """Point 33: gpt-4o-mini builds the memory, gpt-5-mini answers and judges."""
+    """The GLM roles must come from Bailian, the protocol judge stays put."""
 
-    def test_eval_large_pins_the_point33_roles(self):
+    def test_bailian_config_wires_glm_to_dashscope(self):
         import importlib
 
         from run_experiment import model_summary
@@ -3808,44 +3689,20 @@ class BailianConfigTests(unittest.TestCase):
         # Other tests stub ``runtime`` globally; reload so this test reads the
         # real loader (the same pattern RunnerMainWiringTests uses).
         importlib.reload(runtime)
-        config = runtime.load_memory_config(
-            EXPERIMENT_DIR / "configs" / "eval_large.yaml"
-        )
-        models = model_summary(config)
-
-        self.assertEqual(models["memory_builder"], "openrouter/openai/gpt-4o-mini")
-        self.assertEqual(models["adjudication_model"], "openrouter/openai/gpt-4o-mini")
-        self.assertEqual(models["answer_model"], "openrouter/openai/gpt-5-mini")
-        self.assertEqual(models["judge_model"], "openrouter/openai/gpt-5-mini")
-        self.assertEqual(models["embedding"], "ollama/qwen3-embedding")
-
-        # gpt-4o-mini rejects a completion budget above its 16384-token cap, so
-        # the builder stage must not ask for upstream's 32768.
-        builder_cap = config.memory.backends["v4"]["prompt_output_tokens"]
-        self.assertEqual(builder_cap["memory_builder"], 16384)
-
-    def test_bailian_config_is_role_identical_to_eval_large(self):
-        import importlib
-
-        from run_experiment import model_summary
-
-        importlib.reload(runtime)
         config_path = EXPERIMENT_DIR / "configs" / "eval_large_bailian.yaml"
         config = runtime.load_memory_config(config_path)
         models = model_summary(config)
 
-        # Bailian serves no OpenAI model, and point 33 puts every cloud role on
-        # one, so nothing is left to route through DashScope here.
-        self.assertEqual(models["memory_builder"], "openrouter/openai/gpt-4o-mini")
-        self.assertEqual(models["adjudication_model"], "openrouter/openai/gpt-4o-mini")
-        self.assertEqual(models["answer_model"], "openrouter/openai/gpt-5-mini")
-        self.assertEqual(models["judge_model"], "openrouter/openai/gpt-5-mini")
+        self.assertEqual(models["memory_builder"], "dashscope_bailian/glm-5.1")
+        self.assertEqual(models["adjudication_model"], "dashscope_bailian/glm-5.1")
+        self.assertEqual(models["answer_model"], "dashscope_bailian/glm-5.1")
+        self.assertEqual(models["judge_model"], "openrouter/openai/gpt-4o-mini")
         self.assertEqual(models["embedding"], "ollama/qwen3-embedding")
 
         runner_env = runtime.required_env_names(config, runtime.RUNNER_ROLES)
-        self.assertNotIn("DASHSCOPE_API_KEY", runner_env)
-        self.assertIn("OPENROUTER_API_KEY", runner_env)
-        self.assertIn("OPENROUTER_CHAT_COMPLETIONS_ENDPOINT", runner_env)
+        self.assertIn("DASHSCOPE_API_KEY", runner_env)
+        self.assertIn("DASHSCOPE_CHAT_COMPLETIONS_ENDPOINT", runner_env)
+        self.assertNotIn("OPENROUTER_API_KEY", runner_env)
         self.assertEqual(
             runtime.required_env_names(config, runtime.SCORING_ROLES),
             ["OPENROUTER_API_KEY", "OPENROUTER_CHAT_COMPLETIONS_ENDPOINT"],
@@ -3864,9 +3721,7 @@ class BailianConfigTests(unittest.TestCase):
         models = model_summary(config)
 
         self.assertEqual(models["embedding"], "dashscope_bailian/text-embedding-v4")
-        self.assertEqual(models["memory_builder"], "openrouter/openai/gpt-4o-mini")
-        self.assertEqual(models["answer_model"], "openrouter/openai/gpt-5-mini")
-        self.assertEqual(models["judge_model"], "openrouter/openai/gpt-5-mini")
+        self.assertEqual(models["memory_builder"], "dashscope_bailian/glm-5.1")
         self.assertEqual(models["controller"], "dashscope_bailian/qwen3.5-flash")
         self.assertEqual(models["window_planner"], "dashscope_bailian/qwen3.5-flash")
 
@@ -3874,7 +3729,6 @@ class BailianConfigTests(unittest.TestCase):
         self.assertIn("DASHSCOPE_API_KEY", runner_env)
         self.assertIn("DASHSCOPE_CHAT_COMPLETIONS_ENDPOINT", runner_env)
         self.assertIn("DASHSCOPE_EMBEDDINGS_ENDPOINT", runner_env)
-        self.assertIn("OPENROUTER_API_KEY", runner_env)
         self.assertNotIn("OLLAMA_CHAT_ENDPOINT", runner_env)
         self.assertNotIn("OLLAMA_EMBED_ENDPOINT", runner_env)
 

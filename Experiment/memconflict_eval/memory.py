@@ -35,41 +35,16 @@ from .embedding import wrap_embedding_client
 #: that was validated against an older semantic state is replayed as-is; a
 #: ``reinforce <fact_key>`` operation then references a fact key that no longer
 #: exists (``Memory/BUILD`` -> ``builder.py:2023-2031`` -> ``semantic.py:422``)
-#: and the persona dies. The switches below let the harness drop those entries
-#: instead of replaying them, and re-sample the answer that failed.
+#: and the persona dies. The two switches below let the harness drop those
+#: entries instead of replaying them.
 CHECKPOINT_GUARD_ENV = "MEMCONFLICT_CHECKPOINT_GUARD"
 DEFAULT_CHECKPOINT_STAGE = "semantic_update"
-#: How many times an ingest that fails with one of the messages below is retried
-#: after invalidating this namespace's checkpoints. One retry was not enough for
-#: the 2026-09-21 runs: the semantic reducer and the cross-window adjudicator
-#: both reject a *sampled* answer (a trigger ref outside ``local_event_refs``, a
-#: candidate pair answered twice or left out), so a retry is a fresh draw and
-#: often the only thing between a flaky answer and a dead persona. Every retry
-#: recomputes the session's stages, so the budget is deliberately small and
-#: configurable: ``MEMCONFLICT_CHECKPOINT_RETRIES=1`` restores the old single
-#: retry, ``=0`` turns retrying off (the guard then only invalidates).
-CHECKPOINT_RETRIES_ENV = "MEMCONFLICT_CHECKPOINT_RETRIES"
-DEFAULT_CHECKPOINT_RETRIES = 3
-MAX_CHECKPOINT_RETRIES = 10
 _STALE_CHECKPOINT_MARKERS = (
     "references unknown fact key",
     "references evidence outside supplied local event refs",
     "resolves to an existing fact key",
 )
 _STAGE_PATTERN = re.compile(r"stage=([A-Za-z_]+)")
-
-
-def configured_checkpoint_retries() -> int:
-    """Retries after a stale-cache validation failure (default 3, clamped 0..10)."""
-
-    raw = os.getenv(CHECKPOINT_RETRIES_ENV)
-    if raw is None or not str(raw).strip():
-        return DEFAULT_CHECKPOINT_RETRIES
-    try:
-        value = int(str(raw).strip())
-    except ValueError:
-        return DEFAULT_CHECKPOINT_RETRIES
-    return max(0, min(value, MAX_CHECKPOINT_RETRIES))
 
 
 @dataclass(frozen=True)
@@ -249,42 +224,32 @@ class MemConflictMemory:
             return IngestReport(session.session_id, 0, 0.0, None, skipped=True)
 
         dropped = self.drop_stale_checkpoints()
-        # One attempt plus MEMCONFLICT_CHECKPOINT_RETRIES retries. The failing
-        # answer is sampled again on every retry, which is the only repair these
-        # validation errors have; the cache is invalidated first so the retry
-        # recomputes the stage instead of replaying the output that just failed.
-        attempts = 1
-        budget = configured_checkpoint_retries() + 1
-        while True:
-            try:
-                return self._ingest_once(
-                    session, dropped=dropped, retried=attempts > 1
-                )
-            except Exception as error:  # noqa: BLE001 - re-raised unless the guard applies
-                if not self.checkpoint_guard_enabled() or not _is_stale_checkpoint_error(error):
-                    raise
+        try:
+            return self._ingest_once(session, dropped=dropped)
+        except Exception as error:  # noqa: BLE001 - re-raised unless the guard applies
+            if not self.checkpoint_guard_enabled() or not _is_stale_checkpoint_error(error):
+                raise
+            invalidated = self.invalidate_checkpoints(
+                stage=_stage_from_error(error) or DEFAULT_CHECKPOINT_STAGE,
+                reason=f"{type(error).__name__}: {error}",
+            )
+            if invalidated <= 0:
+                # The failing stage carried no cache entry; fall back to every
+                # succeeded checkpoint of this namespace. The retry below is
+                # bounded to one attempt either way: the error was fatal
+                # before, and recomputing the session is the only repair.
                 invalidated = self.invalidate_checkpoints(
-                    stage=_stage_from_error(error) or DEFAULT_CHECKPOINT_STAGE,
-                    reason=f"{type(error).__name__}: {error}",
+                    stage=None, reason=f"{type(error).__name__}: {error}"
                 )
-                if invalidated <= 0:
-                    # The failing stage carried no cache entry; fall back to
-                    # every succeeded checkpoint of this namespace, so a resumed
-                    # run recomputes instead of replaying the stale output.
-                    invalidated = self.invalidate_checkpoints(
-                        stage=None, reason=f"{type(error).__name__}: {error}"
-                    )
-                dropped += invalidated
-                if attempts >= budget:
-                    raise
-                attempts += 1
-                print(
-                    f"[warn] {type(error).__name__} while ingesting session "
-                    f"{session.session_id} of {self.namespace}: invalidated "
-                    f"{invalidated} cached checkpoint(s) and retrying "
-                    f"(attempt {attempts}/{budget})",
-                    file=sys.stderr,
-                )
+            print(
+                f"[warn] {type(error).__name__} while ingesting session "
+                f"{session.session_id} of {self.namespace}: invalidated "
+                f"{invalidated} cached checkpoint(s) and retrying once",
+                file=sys.stderr,
+            )
+            return self._ingest_once(
+                session, dropped=dropped + invalidated, retried=True
+            )
 
     def _ingest_once(
         self,
@@ -328,11 +293,6 @@ class MemConflictMemory:
         if raw is None or not str(raw).strip():
             return True
         return str(raw).strip().lower() not in {"0", "false", "no", "off"}
-
-    @staticmethod
-    def checkpoint_retries() -> int:
-        """Retries after a stale-cache failure (``MEMCONFLICT_CHECKPOINT_RETRIES``)."""
-        return configured_checkpoint_retries()
 
     def drop_stale_checkpoints(self, *, reason: str = "stale_scope_revision") -> int:
         """Invalidate cached outputs recorded against an older scope revision.

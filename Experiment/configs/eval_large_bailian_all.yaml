@@ -1,14 +1,11 @@
 # Point 27 / no-campus-network variant: the same experiment as
-# eval_large.yaml, but *every* model role that the local Ollama could serve
-# comes from Bailian (DashScope) instead. Use it when the machine that runs the
+# eval_large_bailian.yaml, but *every* model role comes from Bailian (DashScope)
+# instead of the GPU server's Ollama. Use it when the machine that runs the
 # shard cannot reach the campus Ollama containers (e.g. a cloud host).
 #
 # Role split:
-#   * memory_builder / adjudication_model -> OpenRouter openai/gpt-4o-mini
-#     (point 33), i.e. the same as eval_large.yaml. Bailian serves no OpenAI
-#     model, so this config needs OpenRouter for the builder, the answerer and
-#     the judge.
-#   * answer_model / judge_model -> OpenRouter openai/gpt-5-mini (point 33).
+#   * memory_builder / adjudication_model / answer_model -> Bailian (as in
+#     eval_large_bailian.yaml), model `glm-5.1`.
 #   * window_planner / controller / entity_judge / decomposition_gate / slm ->
 #     Bailian chat model (`qwen3.5-flash` below: the local 9.7B Q4 model's job is
 #     schema-shaped JSON, not deep reasoning). Change it if check_channels or a
@@ -20,7 +17,8 @@
 #     continued with the other: switching embeddings means a fresh --output-dir
 #     (run_experiment.py refuses --resume across a model change unless
 #     --allow-model-change is passed).
-#     On a mainland-China host without a proxy, score with
+#   * judge_model -> OpenRouter openai/gpt-4o-mini, unchanged (the protocol
+#     names that judge). On a mainland-China host without a proxy, score with
 #     --config Experiment/configs/eval_large_dsjudge.yaml instead, or copy the
 #     three JSONL files back and score on a machine that has the proxy.
 #
@@ -30,8 +28,7 @@
 #
 # Requires in Experiment/.env: DASHSCOPE_API_KEY,
 # DASHSCOPE_CHAT_COMPLETIONS_ENDPOINT, DASHSCOPE_EMBEDDINGS_ENDPOINT and (for the
-# builder, answerer and judge) OPENROUTER_API_KEY +
-# OPENROUTER_CHAT_COMPLETIONS_ENDPOINT. No OLLAMA_*.
+# judge) OPENROUTER_API_KEY + OPENROUTER_CHAT_COMPLETIONS_ENDPOINT. No OLLAMA_*.
 
 experiment:
   track: evaluation
@@ -42,38 +39,29 @@ models:
     api_key_env: DASHSCOPE_API_KEY
     embeddings_endpoint_env: DASHSCOPE_EMBEDDINGS_ENDPOINT
     timeout: 120
-  # Point 33: memory construction is openai/gpt-4o-mini on OpenRouter.
-  memory_builder: &memory_chat
+  memory_builder: &bailian_large
+    provider: dashscope_bailian
+    model: glm-5.1
+    api_key_env: DASHSCOPE_API_KEY
+    chat_completions_endpoint_env: DASHSCOPE_CHAT_COMPLETIONS_ENDPOINT
+    temperature: 0.0
+    timeout: 300
+    extra_body:
+      max_tokens: 32768
+  adjudication_model: *bailian_large
+  answer_model: *bailian_large
+  judge_model:
     provider: openrouter
     model: openai/gpt-4o-mini
     api_key_env: OPENROUTER_API_KEY
     chat_completions_endpoint_env: OPENROUTER_CHAT_COMPLETIONS_ENDPOINT
     temperature: 0.0
-    timeout: 300
+    timeout: 120
     extra_body:
-      # gpt-4o-mini's hard completion cap; prompt_output_tokens.memory_builder
-      # below stays inside it (16384).
-      max_tokens: 16384
+      max_tokens: 512
       provider:
         order: ["OpenAI", "Azure"]
         allow_fallbacks: true
-  adjudication_model: *memory_chat
-  # Point 33: answering and judging are both openai/gpt-5-mini.
-  answer_model: &gpt5_chat
-    provider: openrouter
-    model: openai/gpt-5-mini
-    api_key_env: OPENROUTER_API_KEY
-    chat_completions_endpoint_env: OPENROUTER_CHAT_COMPLETIONS_ENDPOINT
-    # Reasoning model: default temperature only, and a real output budget so
-    # reasoning tokens cannot swallow the answer / judge JSON.
-    temperature: 1.0
-    timeout: 300
-    extra_body:
-      max_tokens: 8192
-      provider:
-        order: ["OpenAI", "Azure"]
-        allow_fallbacks: true
-  judge_model: *gpt5_chat
   window_planner: &bailian_control
     provider: dashscope_bailian
     model: qwen3.5-flash
@@ -106,8 +94,7 @@ memory:
       entity_judge_workers: 2
       entity_auto_merge_policy: conservative
       prompt_output_tokens:
-        # gpt-4o-mini (point 33) caps completions at 16384 tokens.
-        memory_builder: 16384
+        memory_builder: 32768
         semantic_reducer: 8192
         window_boundary: 512
         entity_judge: 2048

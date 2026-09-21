@@ -125,10 +125,18 @@ Two consequences of the swap:
   and gpt-5-mini only accepts the default temperature (1.0, set in the config).
   The upstream client also always disables thinking
   (`reasoning: {enabled: false, effort: none}` for OpenRouter, from
-  `Retrival-Mem`'s `disable_request_thinking`); if a serving endpoint rejects
-  that field, the answering and judging lanes error on every question -- run
-  `check_channels.py --roles answer_model,judge_model` once before a long run
-  and score with `configs/eval_large_dsjudge.yaml` if the judge fails.
+  `Retrival-Mem`'s `disable_request_thinking`). OpenAI's gpt-5-mini endpoint
+  answers that with `400 Reasoning is mandatory for this endpoint and cannot be
+  disabled`, which is not a transient error: measured on 2026-09-21 both live
+  shards recorded `Answer_Error` for every single question (9/9 and 12/12).
+  `memconflict_eval/openrouter_reasoning.py` now rewrites that field for the
+  reasoning-mandatory models into `reasoning: {effort: minimal}` (measured: 200
+  with `minimal`, `low` or no field at all), and
+  `MEMCONFLICT_REASONING_EFFORT` / `MEMCONFLICT_REASONING_GUARD=0` tune or
+  restore the upstream shape. Everything else keeps the upstream request
+  unchanged. `check_channels.py --roles answer_model,judge_model` is still the
+  one-second preflight for the lane; score with `configs/eval_large_dsjudge.yaml`
+  if the judge lane is down for another reason.
 
 ### Points 16 + 17: several GPUs, several personas at once
 

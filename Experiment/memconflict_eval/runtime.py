@@ -97,6 +97,12 @@ def import_retrival_mem(root: Path | None = None):
         load_config,
     )
 
+    from .openrouter_reasoning import install_reasoning_guard
+
+    # The checkout stays read-only, so a request shape the provider rejects is
+    # repaired here instead (see the module docstring of the guard).
+    install_reasoning_guard()
+
     return SimpleNamespace(
         MemorySystem=MemorySystem,
         make_chat_client=make_chat_client,

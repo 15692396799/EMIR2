@@ -27,7 +27,9 @@ config load by ``runtime.load_memory_config``.
 
 from __future__ import annotations
 
+import json
 import os
+import urllib.request
 from urllib.parse import urlsplit
 
 #: Comma/space separated list of Ollama containers available to a run.
@@ -144,6 +146,47 @@ def assign_units(units: list[str], count: int) -> list[str | None]:
     return [units[index % len(units)] for index in range(count)]
 
 
+def probe_unit(base_url: str, timeout: float = 5.0) -> tuple[bool, str]:
+    """Ask one container for its model list; ``GET /api/tags`` is the cheap check.
+
+    Deliberately not ``nvidia-smi`` and not ``/api/ps``: a healthy but idle
+    container unloads its model, and a container that lost its GPU still
+    answers -- this probe only answers "is this lane up at all".
+    """
+    base = normalize_base_url(base_url)
+    request = urllib.request.Request(base + "/api/tags", headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=max(0.5, float(timeout))) as response:
+            payload = json.load(response)
+    except Exception as error:  # noqa: BLE001 - reported to the caller
+        return False, f"{type(error).__name__}: {error}"
+    models = payload.get("models")
+    return True, f"{len(models) if isinstance(models, list) else 0} model(s)"
+
+
+def split_reachable(
+    units: list[str], timeout: float = 5.0
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """Split a lane list into ``(reachable, [(unreachable, reason), ...])``.
+
+    Point 16 asks for many containers; a container that is down (or still
+    starting) takes its personas with it, so the caller checks the lanes before
+    the run instead of discovering it hours later.
+    """
+    reachable: list[str] = []
+    unreachable: list[tuple[str, str]] = []
+    for base in units:
+        try:
+            ok, detail = probe_unit(base, timeout)
+        except ValueError as error:  # malformed URL, reported like a dead lane
+            ok, detail = False, str(error)
+        if ok:
+            reachable.append(base)
+        else:
+            unreachable.append((base, detail))
+    return reachable, unreachable
+
+
 __all__ = [
     "ACTIVE_UNIT_ENV",
     "ENDPOINT_ENV_KEYS",
@@ -156,5 +199,7 @@ __all__ = [
     "configured_units",
     "normalize_base_url",
     "parse_base_urls",
+    "probe_unit",
     "routes_for",
+    "split_reachable",
 ]

@@ -8,7 +8,7 @@ REM    resume     continue an interrupted run in the same folder
 REM    noscore    run only, no scoring
 REM    preflight  only check the container and the model channels
 REM    quick      small smoke instead of the one-hour workload
-REM    dsjudge    score with DeepSeek instead of OpenRouter's gpt-4o-mini
+REM    dsjudge    score with DeepSeek instead of OpenRouter's gpt-5-mini
 REM    dryrun     print the commands it would run, then stop
 REM ===================================================================
 setlocal
@@ -71,7 +71,7 @@ python Experiment\tools\check_channels.py --config %CONFIG% --roles memory_build
 if errorlevel 1 goto :preflight_failed
 
 echo.
-echo ==^> preflight: judge channel (gpt-4o-mini via OpenRouter's OpenAI endpoint)
+echo ==^> preflight: judge channel (gpt-5-mini via OpenRouter's OpenAI endpoint)
 python Experiment\tools\check_channels.py --config %CONFIG% --roles judge_model
 if errorlevel 1 (
   echo    WARNING: the judge channel is geo-filtered right now. The run does not need it,
@@ -134,7 +134,7 @@ if not defined NOSCORE (
       echo.
       echo    OpenRouter judge failed with a geo 403. Retrying with DeepSeek direct.
       echo    NOTE: those tables use deepseek-chat as judge, not the protocol's
-      echo          openai/gpt-4o-mini - say so when you report the numbers.
+      echo          openai/gpt-5-mini - say so when you report the numbers.
       python -u Experiment\run_scoring.py --run-dir %RUNDIR% --config Experiment\configs\eval_large_dsjudge.yaml
       if errorlevel 1 echo    scoring failed with DeepSeek too - check the messages above
     )

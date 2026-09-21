@@ -29,7 +29,8 @@
 29. 现在运行的ollama容器中的qwen模型是否能用百炼上的模型替代？如果替代的话，测出来的切片又是否能合并？
 30. debug：C盘临时空间用完
 31. debug：模型在adjudication时把方向写反；修改了Retrieval Mem
-32. 
+32. ollama容器多开；我们计划再在device2,3上开新的ollama容器ollama021-3-1和ollama021-3-2
+33. 记忆构建和打分模型调换；打分模型更换成gpt-5-mini；记忆构建模型更换成gpt-4o-mini
 
 ```
 
@@ -58,10 +59,10 @@ python -u Experiment\run_scoring.py --run-dir Experiment\runs\scale1h
 python Experiment\tools\shard_plan.py --only 1
 
 #shard_1
-python -u Experiment\run_experiment.py --config Experiment\configs\eval_large_bailian.yaml --persona-indices 0,4,18,27,28 --persona-workers 5 --answer-workers 4 --extraction-workers 2 --entity-judge-workers 1 --output-dir Experiment\runs\shard_1
+python -u Experiment\run_experiment.py --config Experiment\configs\eval_large.yaml --persona-indices 0,4,18,27,28 --persona-workers 6 --answer-workers 4 --extraction-workers 2 --entity-judge-workers 1 --output-dir Experiment\runs\shard_1
 
 #shard_2
-python -u Experiment\run_experiment.py --config Experiment\configs\eval_large_bailian.yaml --persona-indices 13,16,24,25,29 --persona-workers 5 --answer-workers 4 --extraction-workers 2 --entity-judge-workers 1 --ollama-units http://172.26.94.12:41133 --output-dir Experiment\runs\shard_2
+python -u Experiment\run_experiment.py --config Experiment\configs\eval_large.yaml --persona-indices 13,16,24,25,29 --persona-workers 6 --answer-workers 4 --extraction-workers 2 --entity-judge-workers 1 --output-dir Experiment\runs\shard_2
 
 #shard_3
 python -u Experiment\run_experiment.py --config Experiment\configs\eval_large_bailian.yaml --persona-indices 1,3,7,14,19 --persona-workers 5 --answer-workers 4 --extraction-workers 2 --entity-judge-workers 1 --ollama-units http://172.26.94.12:41136 --output-dir Experiment\runs\shard_3

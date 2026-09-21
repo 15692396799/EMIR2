@@ -82,7 +82,8 @@ class MemConflictJudge:
         self.config = config if config is not None else runtime.load_memory_config()
         # build_chat_client adds the azure provider (api-key header + deployment
         # path), which is how the judge moves off OpenRouter's geo-gated
-        # openai/gpt-4o-mini without touching the read-only checkout.
+        # OpenRouter judge lane (openai/gpt-5-mini since point 33) without
+        # touching the read-only checkout.
         # build_chat_client also wraps it in the retrying client, which rides
         # out OpenRouter's bursty 403 (geo) and 5xx/429 responses instead of
         # losing a persona's whole judging pass.

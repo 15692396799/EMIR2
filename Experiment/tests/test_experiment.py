@@ -256,6 +256,42 @@ class AnswerPromptTests(unittest.TestCase):
             build_answer_messages("Q?", "ctx", "temporal")
 
 
+class EmptyAnswerGuardTests(unittest.TestCase):
+    """Point 33: a blank completion is an Answer_Error, not a stored answer.
+
+    The answering role is a reasoning model now, and such a model can spend its
+    whole budget on reasoning tokens and return empty content. Storing that as
+    the answer would show up as a wrong answer in AA with no trace of why.
+    """
+
+    def _answerer(self, response):
+        from memconflict_eval.answering import MemConflictAnswerer
+
+        answerer = MemConflictAnswerer.__new__(MemConflictAnswerer)
+        answerer.config = SimpleNamespace(
+            answer_model=SimpleNamespace(provider="openrouter")
+        )
+        answerer.client = _FakeChatClient(response)
+        return answerer
+
+    def test_blank_completion_raises_instead_of_storing_a_blank_answer(self):
+        from memconflict_eval.answering import EmptyAnswerError
+
+        _conflict_type, _gold, question = _sample_question()
+        for blank in (None, "", "   \n"):
+            with self.subTest(response=repr(blank)):
+                with self.assertRaises(EmptyAnswerError):
+                    self._answerer(blank).answer(question, [], memory_context="ctx")
+
+    def test_a_real_answer_is_returned_trimmed(self):
+        _conflict_type, _gold, question = _sample_question()
+        result = self._answerer("  Yes.  ").answer(
+            question, [], memory_context="ctx"
+        )
+        self.assertEqual(result.text, "Yes.")
+        self.assertEqual(result.context, "ctx")
+
+
 class JudgePromptTests(unittest.TestCase):
     def _messages(self, conflict_type="dynamic_conflict"):
         memories = [
@@ -1535,6 +1571,51 @@ class OllamaUnitTests(unittest.TestCase):
             ["http://gpu:1", "http://gpu:2", "http://gpu:1", "http://gpu:2", "http://gpu:1"],
         )
         self.assertEqual(ollama_units.assign_units([], 2), [None, None])
+
+    def test_split_reachable_separates_the_dead_lanes(self):
+        """Point 16: a down container must be visible before the run starts."""
+
+        def fake_probe(base_url, timeout=5.0):
+            return (False, "URLError: refused") if "41134" in base_url else (True, "8 model(s)")
+
+        original = ollama_units.probe_unit
+        ollama_units.probe_unit = fake_probe
+        try:
+            reachable, unreachable = ollama_units.split_reachable(
+                ["http://gpu:41133", "http://gpu:41134", "http://gpu:41135"]
+            )
+        finally:
+            ollama_units.probe_unit = original
+        self.assertEqual(reachable, ["http://gpu:41133", "http://gpu:41135"])
+        self.assertEqual(unreachable, [("http://gpu:41134", "URLError: refused")])
+
+    def test_preflight_stops_on_a_dead_lane_and_ignores_it_on_request(self):
+        """A dead lane used to kill its personas hours in; now it stops the run."""
+
+        from run_experiment import preflight_units
+
+        original = ollama_units.split_reachable
+        ollama_units.split_reachable = lambda units, timeout=5.0: (
+            [unit for unit in units if unit != "http://gpu:41134"],
+            [("http://gpu:41134", "URLError: refused")],
+        )
+        units = ["http://gpu:41133", "http://gpu:41134"]
+        try:
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                self.assertIsNone(preflight_units(units))
+            self.assertIn("41134", stderr.getvalue())
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(
+                    preflight_units(units, allow_missing=True), ["http://gpu:41133"]
+                )
+            ollama_units.split_reachable = lambda units, timeout=5.0: (
+                [],
+                [(unit, "down") for unit in units],
+            )
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertIsNone(preflight_units(units, allow_missing=True))
+        finally:
+            ollama_units.split_reachable = original
 
 
 class UnitRoutingTests(unittest.TestCase):
@@ -3634,9 +3715,9 @@ class ResumeModelGuardTests(unittest.TestCase):
 
 
 class BailianConfigTests(unittest.TestCase):
-    """The GLM roles must come from Bailian, the protocol judge stays put."""
+    """Point 33: gpt-4o-mini builds the memory, gpt-5-mini answers and judges."""
 
-    def test_bailian_config_wires_glm_to_dashscope(self):
+    def test_eval_large_pins_the_point33_roles(self):
         import importlib
 
         from run_experiment import model_summary
@@ -3644,20 +3725,44 @@ class BailianConfigTests(unittest.TestCase):
         # Other tests stub ``runtime`` globally; reload so this test reads the
         # real loader (the same pattern RunnerMainWiringTests uses).
         importlib.reload(runtime)
+        config = runtime.load_memory_config(
+            EXPERIMENT_DIR / "configs" / "eval_large.yaml"
+        )
+        models = model_summary(config)
+
+        self.assertEqual(models["memory_builder"], "openrouter/openai/gpt-4o-mini")
+        self.assertEqual(models["adjudication_model"], "openrouter/openai/gpt-4o-mini")
+        self.assertEqual(models["answer_model"], "openrouter/openai/gpt-5-mini")
+        self.assertEqual(models["judge_model"], "openrouter/openai/gpt-5-mini")
+        self.assertEqual(models["embedding"], "ollama/qwen3-embedding")
+
+        # gpt-4o-mini rejects a completion budget above its 16384-token cap, so
+        # the builder stage must not ask for upstream's 32768.
+        builder_cap = config.memory.backends["v4"]["prompt_output_tokens"]
+        self.assertEqual(builder_cap["memory_builder"], 16384)
+
+    def test_bailian_config_is_role_identical_to_eval_large(self):
+        import importlib
+
+        from run_experiment import model_summary
+
+        importlib.reload(runtime)
         config_path = EXPERIMENT_DIR / "configs" / "eval_large_bailian.yaml"
         config = runtime.load_memory_config(config_path)
         models = model_summary(config)
 
-        self.assertEqual(models["memory_builder"], "dashscope_bailian/glm-5.1")
-        self.assertEqual(models["adjudication_model"], "dashscope_bailian/glm-5.1")
-        self.assertEqual(models["answer_model"], "dashscope_bailian/glm-5.1")
-        self.assertEqual(models["judge_model"], "openrouter/openai/gpt-4o-mini")
+        # Bailian serves no OpenAI model, and point 33 puts every cloud role on
+        # one, so nothing is left to route through DashScope here.
+        self.assertEqual(models["memory_builder"], "openrouter/openai/gpt-4o-mini")
+        self.assertEqual(models["adjudication_model"], "openrouter/openai/gpt-4o-mini")
+        self.assertEqual(models["answer_model"], "openrouter/openai/gpt-5-mini")
+        self.assertEqual(models["judge_model"], "openrouter/openai/gpt-5-mini")
         self.assertEqual(models["embedding"], "ollama/qwen3-embedding")
 
         runner_env = runtime.required_env_names(config, runtime.RUNNER_ROLES)
-        self.assertIn("DASHSCOPE_API_KEY", runner_env)
-        self.assertIn("DASHSCOPE_CHAT_COMPLETIONS_ENDPOINT", runner_env)
-        self.assertNotIn("OPENROUTER_API_KEY", runner_env)
+        self.assertNotIn("DASHSCOPE_API_KEY", runner_env)
+        self.assertIn("OPENROUTER_API_KEY", runner_env)
+        self.assertIn("OPENROUTER_CHAT_COMPLETIONS_ENDPOINT", runner_env)
         self.assertEqual(
             runtime.required_env_names(config, runtime.SCORING_ROLES),
             ["OPENROUTER_API_KEY", "OPENROUTER_CHAT_COMPLETIONS_ENDPOINT"],
@@ -3676,7 +3781,9 @@ class BailianConfigTests(unittest.TestCase):
         models = model_summary(config)
 
         self.assertEqual(models["embedding"], "dashscope_bailian/text-embedding-v4")
-        self.assertEqual(models["memory_builder"], "dashscope_bailian/glm-5.1")
+        self.assertEqual(models["memory_builder"], "openrouter/openai/gpt-4o-mini")
+        self.assertEqual(models["answer_model"], "openrouter/openai/gpt-5-mini")
+        self.assertEqual(models["judge_model"], "openrouter/openai/gpt-5-mini")
         self.assertEqual(models["controller"], "dashscope_bailian/qwen3.5-flash")
         self.assertEqual(models["window_planner"], "dashscope_bailian/qwen3.5-flash")
 
@@ -3684,6 +3791,7 @@ class BailianConfigTests(unittest.TestCase):
         self.assertIn("DASHSCOPE_API_KEY", runner_env)
         self.assertIn("DASHSCOPE_CHAT_COMPLETIONS_ENDPOINT", runner_env)
         self.assertIn("DASHSCOPE_EMBEDDINGS_ENDPOINT", runner_env)
+        self.assertIn("OPENROUTER_API_KEY", runner_env)
         self.assertNotIn("OLLAMA_CHAT_ENDPOINT", runner_env)
         self.assertNotIn("OLLAMA_EMBED_ENDPOINT", runner_env)
 

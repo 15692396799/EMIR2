@@ -120,6 +120,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--allow-missing-units",
+        action="store_true",
+        help=(
+            "Point 16: run on the Ollama lanes that answer instead of aborting "
+            "when a container in the list is down. Without this flag a dead "
+            "lane stops the run before the first persona, because every persona "
+            "assigned to it would fail on its first call."
+        ),
+    )
+    parser.add_argument(
         "--answer-workers",
         type=int,
         default=4,
@@ -238,6 +248,44 @@ def load_completed_sessions(path: Path) -> dict[str, set[int]]:
                 continue
             completed.setdefault(persona_id, set()).add(session_id)
     return completed
+
+
+def preflight_units(units: list[str], *, allow_missing: bool = False) -> list[str] | None:
+    """Point 16: check every Ollama lane before a long run starts.
+
+    A container that is down (or still coming up) makes every persona assigned
+    to it fail on its first embedding call, which used to surface hours into a
+    run. Probing up front turns that into a one-second startup failure. With
+    ``--allow-missing-units`` the dead lanes are dropped and the round robin
+    continues on the containers that do answer; ``None`` means "stop".
+    """
+    reachable, unreachable = ollama_units.split_reachable(units)
+    for base, detail in unreachable:
+        print(f"[ollama] lane DOWN         : {base} ({detail})", file=sys.stderr)
+    if not unreachable:
+        print(f"[ollama] units             : {len(reachable)} ({', '.join(reachable)})")
+        return reachable
+    if not allow_missing:
+        print(
+            f"[error] {len(unreachable)} of {len(units)} Ollama lane(s) do not answer: "
+            + ", ".join(base for base, _ in unreachable),
+            file=sys.stderr,
+        )
+        print(
+            "        start them on the GPU server "
+            "(Experiment/tools/ollama_containers.sh start) or run with "
+            "--allow-missing-units to use the lanes that answer.",
+            file=sys.stderr,
+        )
+        return None
+    if not reachable:
+        print("[error] no Ollama lane answers; nothing left to run on", file=sys.stderr)
+        return None
+    print(
+        f"[warn] continuing with {len(reachable)} of {len(units)} Ollama lane(s)",
+        file=sys.stderr,
+    )
+    return reachable
 
 
 def persona_job(payload: dict[str, Any]) -> dict[str, Any]:
@@ -580,7 +628,7 @@ MODEL_ROLES = (
 
 
 def model_summary(config: Any) -> dict[str, str]:
-    """``{"memory_builder": "dashscope_bailian/glm-5.1", ...}`` for run_meta."""
+    """``{"memory_builder": "openrouter/openai/gpt-4o-mini", ...}`` for run_meta."""
     summary: dict[str, str] = {}
     for role in MODEL_ROLES:
         model = getattr(config, role, None)
@@ -711,7 +759,9 @@ def main(argv: list[str] | None = None) -> int:
 
     units = ollama_units.configured_units()
     if units:
-        print(f"[ollama] units             : {len(units)} ({', '.join(units)})")
+        units = preflight_units(units, allow_missing=bool(args.allow_missing_units))
+        if units is None:
+            return 2
     persona_workers = max(1, int(args.persona_workers))
     if persona_workers > 1:
         print(f"[persona] workers          : {persona_workers} process(es)")

@@ -18,6 +18,18 @@ from .memory import RetrievedMemory
 from .prompts import build_answer_messages, format_memory_context
 
 
+class EmptyAnswerError(RuntimeError):
+    """The answer model returned no content.
+
+    Point 33 puts a reasoning model (``openai/gpt-5-mini``) in the answering
+    role. Such a model can spend its whole completion budget on reasoning tokens
+    and return an empty ``content``; the upstream client then hands back ``None``
+    (or ``"None"`` once stringified), which used to be stored as a normal answer
+    and scored as a wrong one. Raising turns that into a visible
+    ``Answer_Error`` on the question row instead of a silent zero.
+    """
+
+
 @dataclass
 class AnswerResult:
     text: str
@@ -54,4 +66,10 @@ class MemConflictAnswerer:
         start = time.perf_counter()
         text = self.client.chat(messages)
         duration_ms = (time.perf_counter() - start) * 1000.0
-        return AnswerResult(text=str(text).strip(), duration_ms=duration_ms, context=context)
+        answer = "" if text is None else str(text).strip()
+        if not answer:
+            raise EmptyAnswerError(
+                "the answer model returned empty content (reasoning model out of "
+                "output budget?); raise the answer_model max_tokens in the config"
+            )
+        return AnswerResult(text=answer, duration_ms=duration_ms, context=context)

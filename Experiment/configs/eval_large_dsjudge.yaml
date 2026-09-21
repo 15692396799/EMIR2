@@ -1,18 +1,22 @@
-# Same roles as eval_large.yaml, but the judge is DeepSeek's own API instead of
-# OpenRouter's openai/gpt-4o-mini.
+# Same roles as eval_large.yaml (point 33: memory construction on
+# openai/gpt-4o-mini, answering on openai/gpt-5-mini), but the judge is
+# DeepSeek's own API instead of OpenRouter's openai/gpt-5-mini.
 #
-# Why: OpenRouter geo-gates gpt-4o-mini (and intermittently every other model)
-# from this machine -- "This model is not available in your region." DeepSeek's
-# direct endpoint answers from here, is cheap, and is a different vendor from
-# the z-ai/glm-5.1 that builds and answers, so the judge stays independent.
-# The runner roles are untouched, so a run started with eval_large.yaml can be
-# scored with this config (the judge only reads the answers).
+# Why: OpenRouter geo-gates its OpenAI endpoints (gpt-5-mini now, gpt-4o-mini
+# before point 33) and intermittently every other model from this machine --
+# "This model is not available in your region." DeepSeek's direct endpoint
+# answers from here, is cheap, and is a different vendor from the OpenAI models
+# that build the memory, so the judge stays independent. The runner roles are
+# untouched, so a run started with eval_large.yaml can be scored with this
+# config (the judge only reads the answers).
 #
 #   python Experiment/run_scoring.py --run-dir Experiment/runs/<run> \
 #     --config Experiment/configs/eval_large_dsjudge.yaml
 #
 # Requires OPENAI_API_KEY and OPENAI_CHAT_COMPLETIONS_ENDPOINT in Experiment/.env
-# pointing at DeepSeek (the provider name is generic OpenAI-compatible).
+# pointing at DeepSeek (the provider name is generic OpenAI-compatible), plus
+# OPENROUTER_API_KEY + OPENROUTER_CHAT_COMPLETIONS_ENDPOINT for the runner roles
+# of a fresh run (scoring an existing run needs only the DeepSeek pair).
 
 experiment:
   track: evaluation
@@ -22,21 +26,36 @@ models:
     model: qwen3-embedding
     base_url_env: OLLAMA_BASE_URL
     timeout: 600
-  memory_builder: &large_chat
+  # Point 33: memory construction is openai/gpt-4o-mini.
+  memory_builder: &memory_chat
     provider: openrouter
-    model: z-ai/glm-5.1
+    model: openai/gpt-4o-mini
     api_key_env: OPENROUTER_API_KEY
     chat_completions_endpoint_env: OPENROUTER_CHAT_COMPLETIONS_ENDPOINT
     temperature: 0.0
     timeout: 300
     extra_body:
-      max_tokens: 32768
-      # Same Baidu Qianfan pin as eval_large.yaml.
+      max_tokens: 16384
       provider:
-        order: ["Baidu"]
+        order: ["OpenAI", "Azure"]
         allow_fallbacks: true
-  adjudication_model: *large_chat
-  answer_model: *large_chat
+  adjudication_model: *memory_chat
+  # Point 33: the answering role is openai/gpt-5-mini, as in eval_large.yaml.
+  answer_model: &gpt5_chat
+    provider: openrouter
+    model: openai/gpt-5-mini
+    api_key_env: OPENROUTER_API_KEY
+    chat_completions_endpoint_env: OPENROUTER_CHAT_COMPLETIONS_ENDPOINT
+    # Reasoning model: default temperature only, and enough output budget that
+    # reasoning tokens cannot swallow the answer.
+    temperature: 1.0
+    timeout: 300
+    extra_body:
+      max_tokens: 8192
+      # Same OpenAI/Azure pin as eval_large.yaml.
+      provider:
+        order: ["OpenAI", "Azure"]
+        allow_fallbacks: true
   # DeepSeek direct: region-available replacement for the protocol judge.
   judge_model:
     provider: openai
@@ -76,7 +95,8 @@ memory:
       entity_judge_workers: 2
       entity_auto_merge_policy: conservative
       prompt_output_tokens:
-        memory_builder: 32768
+        # gpt-4o-mini (point 33) caps completions at 16384 tokens.
+        memory_builder: 16384
         semantic_reducer: 8192
         window_boundary: 512
         entity_judge: 2048

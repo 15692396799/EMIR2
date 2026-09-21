@@ -140,42 +140,6 @@ def _adjudication_json_schema(
     )
 
 
-def _candidate_pair_key(source_ref: str, target_ref: str) -> tuple[str, str]:
-    """Orientation-insensitive key for one adjudicated candidate pair.
-
-    The adjudication prompt declares ``proposed_edge_type`` and ``signal`` to be
-    non-binding candidate-generation hints, so a decision that swaps source and
-    target still answers the same candidate pair. Only the pairing is normalised
-    here; the persisted edge keeps the orientation the model chose.
-    """
-    return (
-        (source_ref, target_ref)
-        if source_ref <= target_ref
-        else (target_ref, source_ref)
-    )
-
-
-def _compact_adjudication_decisions(decisions: Iterable[Any]) -> list[Any]:
-    """Projection of a previous adjudication answer for the repair prompt.
-
-    Only the pair bookkeeping survives a retry: confidences and explanations
-    would bloat the payload without helping the model repair a structural error.
-    """
-    compact: list[Any] = []
-    for decision in list(decisions)[:64]:
-        if isinstance(decision, dict):
-            compact.append(
-                {
-                    "source_ref": decision.get("source_ref"),
-                    "target_ref": decision.get("target_ref"),
-                    "edge_type": decision.get("edge_type"),
-                }
-            )
-        else:
-            compact.append(decision)
-    return compact
-
-
 def _stable_digest(value: Any) -> str:
     return sha256(
         json.dumps(
@@ -2689,15 +2653,9 @@ class V4MemoryBuilder:
     ) -> list[tuple[str, str, str, float, str, str]]:
         """Return (source, target, edge_type, confidence, trust, explanation).
 
-        With an adjudication LLM: batch-confirm pairs. The LLM may return null to
-        reject a pair, override edge_type, or swap source and target: the proposed
-        edge type and its direction are only candidate-generation hints, and a
-        candidate pair the answer leaves out counts as "no relation". Structurally
-        invalid answers (unknown ref, off-candidate pair, duplicate, bad
-        confidence, missing explanation, unparsable JSON) are re-asked once with
-        validator feedback and only then abort the build. Without an adjudication
-        client (Noop/None): emit all candidates as derived with their proposed
-        type.
+        With an adjudication LLM: batch-confirm pairs (LLM may return null to
+        reject, or override edge_type). Without one (Noop/None): emit all
+        candidates as derived with their proposed type.
         """
         if self.adjudication_client is None or isinstance(self.adjudication_client, NoopChatClient):
             return [
@@ -2781,49 +2739,34 @@ class V4MemoryBuilder:
                 for item in cached["output"]
             ]
 
-        schema = _adjudication_json_schema(pairs_payload)
-        messages: list[dict[str, str]] = [
-            {
-                "role": "system",
-                "content": (
-                    "Return only valid JSON grounded in the supplied evidence. "
-                    + UNTRUSTED_DATA_INSTRUCTION
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps(payload, ensure_ascii=False),
-            },
-        ]
-        ref_to_id = {ref: node_id for node_id, ref in ref_of.items()}
-        expected_pairs = {
-            _candidate_pair_key(item["source_ref"], item["target_ref"])
-            for item in pairs_payload
-        }
-        required_pairs = [
-            {
-                "source_ref": item["source_ref"],
-                "target_ref": item["target_ref"],
-            }
-            for item in pairs_payload
-        ]
-        last_decisions: list[Any] | None = None
-        last_raw: str = ""
-
         def invoke() -> list[tuple[str, str, str, float, str, str]]:
-            nonlocal last_decisions, last_raw
             assert self.adjudication_client is not None
+            schema = _adjudication_json_schema(pairs_payload)
             raw = self.adjudication_client.chat(
-                messages_with_json_schema(messages, schema),
+                messages_with_json_schema(
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Return only valid JSON grounded in the supplied evidence. "
+                                + UNTRUSTED_DATA_INSTRUCTION
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": json.dumps(payload, ensure_ascii=False),
+                        },
+                    ],
+                    schema,
+                ),
                 json_mode=True,
                 json_schema=schema,
             )
-            last_raw = raw if isinstance(raw, str) else str(raw)
             data = parse_json_object(raw)
             decisions = data.get("decisions")
             if not isinstance(decisions, list):
                 raise ValueError("adjudication response has no decisions list")
-            last_decisions = decisions
+            ref_to_id = {ref: node_id for node_id, ref in ref_of.items()}
             output: list[tuple[str, str, str, float, str, str]] = []
             seen_pairs: set[tuple[str, str]] = set()
             for decision in decisions:
@@ -2835,15 +2778,9 @@ class V4MemoryBuilder:
                 target = ref_to_id.get(target_ref)
                 if source is None or target is None:
                     raise ValueError("adjudication decision references an unknown node")
-                pair_key = _candidate_pair_key(source_ref, target_ref)
-                if pair_key not in expected_pairs:
-                    raise ValueError(
-                        "adjudication decision is not a candidate pair: "
-                        f"{source_ref}->{target_ref}"
-                    )
-                if pair_key in seen_pairs:
+                if (source_ref, target_ref) in seen_pairs:
                     raise ValueError("adjudication response duplicated a candidate pair")
-                seen_pairs.add(pair_key)
+                seen_pairs.add((source_ref, target_ref))
                 confidence = decision.get("confidence")
                 if (
                     isinstance(confidence, bool)
@@ -2867,40 +2804,13 @@ class V4MemoryBuilder:
                     "explicit",
                     explanation,
                 ))
-            # A candidate pair the model left out is treated as "no relation":
-            # the prompt asks for a conservative reject, and one missing pair
-            # must not abort an ingest that has already cost hours of work.
-            # Structural errors (unknown ref, off-candidate pair, duplicate,
-            # bad confidence, missing explanation) still fail the attempt.
+            expected_pairs = {
+                (item["source_ref"], item["target_ref"])
+                for item in pairs_payload
+            }
+            if seen_pairs != expected_pairs:
+                raise ValueError("adjudication response omitted candidate pairs")
             return output
-
-        def record_failure(attempt: int, error: Exception) -> None:
-            previous: Any = None
-            if last_decisions is not None:
-                previous = _compact_adjudication_decisions(last_decisions)
-            elif last_raw:
-                previous = last_raw[:2000]
-            messages.append({
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "validator_feedback": {
-                            "attempt": attempt,
-                            "error_type": type(error).__name__,
-                            "message": str(error),
-                            "required_candidate_pairs": required_pairs,
-                            "previous_decisions": previous,
-                        },
-                        "instruction": (
-                            "Return one corrected adjudication JSON object only. Emit exactly "
-                            "one decision per required candidate pair, in the listed orientation "
-                            "or its reverse, and use edge_type null to reject a pair."
-                        ),
-                    },
-                    ensure_ascii=False,
-                ),
-            })
-            self._record_checkpoint_failure(descriptor, error, attempt=attempt)
 
         provider, model = self.model_identities.get("adjudication", (None, None))
         result = retry_v4_call(
@@ -2915,8 +2825,9 @@ class V4MemoryBuilder:
             ),
             error_type=V4BuildStageError,
             validation_errors=(ValueError, TypeError),
-            on_failure=record_failure,
-            validation_retries=1,
+            on_failure=lambda attempt, error: self._record_checkpoint_failure(
+                descriptor, error, attempt=1
+            ),
         )
         self._record_checkpoint_success(descriptor, result)
         return result

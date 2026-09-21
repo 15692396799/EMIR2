@@ -79,9 +79,14 @@ class MemConflictJudge:
     """Wraps Retrival-Mem's configured judge model with the MemConflict prompt."""
 
     def __init__(self, config: Any = None, *, top_k: int = 3) -> None:
-        client = runtime.import_retrival_mem()
         self.config = config if config is not None else runtime.load_memory_config()
-        self.client = client.make_chat_client(self.config.judge_model)
+        # build_chat_client adds the azure provider (api-key header + deployment
+        # path), which is how the judge moves off OpenRouter's geo-gated
+        # openai/gpt-4o-mini without touching the read-only checkout.
+        # build_chat_client also wraps it in the retrying client, which rides
+        # out OpenRouter's bursty 403 (geo) and 5xx/429 responses instead of
+        # losing a persona's whole judging pass.
+        self.client = runtime.build_chat_client(self.config.judge_model)
         self.top_k = int(top_k)
 
     def judge(

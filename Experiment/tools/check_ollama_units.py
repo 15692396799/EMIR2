@@ -26,7 +26,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from memconflict_eval import runtime  # noqa: E402
-from memconflict_eval.ollama_units import configured_units  # noqa: E402
+from memconflict_eval.ollama_units import configured_units, parse_base_urls  # noqa: E402
 
 
 def _post(url: str, payload: dict, timeout: float) -> dict:
@@ -36,6 +36,11 @@ def _post(url: str, payload: dict, timeout: float) -> dict:
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+
+def _get(url: str, timeout: float) -> dict:
+    with urllib.request.urlopen(url, timeout=timeout) as response:
         return json.load(response)
 
 
@@ -49,7 +54,7 @@ def probe(base_url: str, model: str, timeout: float) -> dict:
     }
     generated = _post(base_url + "/api/generate", payload, timeout)
     wall = time.perf_counter() - started
-    running = _post(base_url + "/api/ps", {}, timeout)
+    running = _get(base_url + "/api/ps", timeout)
     loaded = next(
         (
             entry
@@ -73,11 +78,23 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="qwen3.5:latest")
     parser.add_argument("--timeout", type=float, default=600.0)
+    parser.add_argument(
+        "--units",
+        default=None,
+        help=(
+            "Comma-separated container base URLs to probe instead of reading "
+            "OLLAMA_BASE_URLS from Experiment/.env. "
+            "Example: http://172.26.94.12:41134,http://172.26.94.12:41135"
+        ),
+    )
     args = parser.parse_args(argv)
     runtime.ensure_utf8_console()
-    runtime.load_env_file()
 
-    units = configured_units()
+    if args.units:
+        units = parse_base_urls(args.units)
+    else:
+        runtime.load_env_file()
+        units = configured_units()
     if not units:
         print("[error] no Ollama units configured (set OLLAMA_BASE_URLS)", file=sys.stderr)
         return 2

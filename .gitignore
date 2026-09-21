@@ -28,6 +28,9 @@ runs_smoke/
 Experiment/runs/
 Experiment/.env
 
+# Point 27 shard plans (generated; reproduce with tools/shard_plan.py --seed N)
+Experiment/shards/
+
 # Editors and OS
 .vscode/
 .idea/

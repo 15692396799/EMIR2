@@ -1,0 +1,127 @@
+# Point 27 / cost: same experiment as eval_large.yaml, but the three
+# large-model roles come from Alibaba Bailian (DashScope) instead of OpenRouter.
+#
+# Why: OpenRouter adds a fee on top of the upstream provider, and those three
+# roles carry almost all of the run's token spend (measured 2026-09-20:
+# memory_builder + adjudication + semantic_reducer = $0.081 per session).
+#
+# Role split:
+#   * memory_builder / adjudication_model / answer_model -> Bailian, OpenAI
+#     compatible endpoint, `enable_thinking: false` is sent by the client for
+#     provider `dashscope_bailian` (memory/clients.py).
+#   * judge_model -> OpenRouter openai/gpt-4o-mini, unchanged: the MemConflict
+#     protocol names that judge, and its total cost is under $1 for the full
+#     benchmark. Use --config Experiment/configs/eval_large_dsjudge.yaml when
+#     the OpenRouter judge is geo-filtered.
+#   * embedding / controller / window_planner / entity_judge / decomposition_gate
+#     / slm -> the GPU server's Ollama, exactly as in eval_large.yaml.
+#
+# Before a long run, verify the channel and the exact model id on Bailian:
+#
+#   python Experiment\tools\check_channels.py --config Experiment\configs\eval_large_bailian.yaml --roles memory_builder,answer_model,adjudication_model
+#   python Experiment\tools\check_channels.py --config Experiment\configs\eval_large_bailian.yaml --roles judge_model
+#
+# Bailian renames third-party models, so `glm-5.1` below must be the id Bailian
+# actually serves (e.g. `glm-5.1` or a vendor-prefixed id). If it differs,
+# change the one line and re-run check_channels; run_meta.json records the
+# provider/model of every role, so the substitution is on the record.
+#
+# Requires in Experiment/.env:
+#   DASHSCOPE_API_KEY, DASHSCOPE_CHAT_COMPLETIONS_ENDPOINT
+#   OPENROUTER_API_KEY, OPENROUTER_CHAT_COMPLETIONS_ENDPOINT (judge only)
+
+experiment:
+  track: evaluation
+models:
+  embedding:
+    provider: ollama
+    model: qwen3-embedding
+    base_url_env: OLLAMA_BASE_URL
+    timeout: 600
+  memory_builder: &bailian_chat
+    provider: dashscope_bailian
+    model: glm-5.1
+    api_key_env: DASHSCOPE_API_KEY
+    chat_completions_endpoint_env: DASHSCOPE_CHAT_COMPLETIONS_ENDPOINT
+    temperature: 0.0
+    timeout: 300
+    extra_body:
+      max_tokens: 32768
+  adjudication_model: *bailian_chat
+  answer_model: *bailian_chat
+  judge_model:
+    provider: openrouter
+    model: openai/gpt-4o-mini
+    api_key_env: OPENROUTER_API_KEY
+    chat_completions_endpoint_env: OPENROUTER_CHAT_COMPLETIONS_ENDPOINT
+    temperature: 0.0
+    timeout: 120
+    extra_body:
+      max_tokens: 512
+      provider:
+        order: ["OpenAI", "Azure"]
+        allow_fallbacks: true
+  window_planner: &control_chat
+    provider: ollama
+    model: qwen3.5:latest
+    base_url_env: OLLAMA_BASE_URL
+    temperature: 0.0
+    timeout: 3600
+  entity_judge: *control_chat
+  controller: *control_chat
+  decomposition_gate: *control_chat
+  slm: *control_chat
+memory:
+  backend: v4
+  memory_extraction_batch_turns: 64
+  memory_extraction_workers: 8
+  llm_max_retries: 2
+  llm_retry_backoff_seconds: 1.0
+  include_retrieval_trace_in_answer_prompt: false
+  answer_context_mode: content aware
+  backends:
+    v4:
+      database_path: data/memconflict_eval.sqlite3
+      faiss_path: data/memconflict_eval_faiss
+      memory_builder_model: memory_builder
+      semantic_state_model: null
+      embedding_model: embedding
+      entity_judge_batch_size: 8
+      entity_judge_workers: 2
+      entity_auto_merge_policy: conservative
+      prompt_output_tokens:
+        memory_builder: 32768
+        semantic_reducer: 8192
+        window_boundary: 512
+        entity_judge: 2048
+        # Same headroom as eval_large.yaml: the builder/adjudicator is a
+        # reasoning model and must fit reasoning tokens plus JSON in the budget.
+        cross_window_adjudication: 16384
+      window_planner:
+        mode: model
+        token_encoding: cl100k_base
+        min_builder_input_tokens: 2048
+        target_builder_input_tokens: 12000
+        max_builder_input_tokens: 30000
+        max_window_turns: 0
+        max_window_atoms: 64
+retrieval:
+  strategy: multi_round
+  controller_profile: teacher
+  strategies:
+    multi_round:
+      controller_model: controller
+      controller_max_retries: 2
+      rank_fusion_constant: 60
+      model_evidence_filter_enabled: false
+evaluation:
+  benchmarks:
+  - locomo
+  benchmark_dir: benchmark
+  output_dir: runs
+  locomo:
+    answer_workers: 4
+    answer_chunk_size: 1
+    judge_workers: 4
+    answer_max_retries: 2
+    use_llm_judge: true

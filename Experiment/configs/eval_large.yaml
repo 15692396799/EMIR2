@@ -37,6 +37,14 @@ models:
     timeout: 300
     extra_body:
       max_tokens: 32768
+      # OpenRouter serves z-ai/glm-5.1 from 14 upstreams (Baidu, AtlasCloud,
+      # SiliconFlow, Z.AI, Venice, ...). Pin the Baidu Qianfan lane: the model
+      # is the same, but the provider (and its latency/region) is not.
+      # allow_fallbacks keeps a long run alive if Baidu is briefly unavailable;
+      # use `only: ["Baidu"]` instead for a hard pin.
+      provider:
+        order: ["Baidu"]
+        allow_fallbacks: true
   adjudication_model: *large_chat
   answer_model: *large_chat
   judge_model:
@@ -48,6 +56,13 @@ models:
     timeout: 120
     extra_body:
       max_tokens: 512
+      # gpt-4o-mini has three OpenRouter endpoints: OpenAI, Azure, Azure.
+      # Keep the protocol judge on OpenAI's own endpoint, and let Azure serve it
+      # when OpenRouter's OpenAI endpoint is geo-filtered for a moment (the 403
+      # arrives before any model runs, so the fallback is the same model).
+      provider:
+        order: ["OpenAI", "Azure"]
+        allow_fallbacks: true
   window_planner: &control_chat
     provider: ollama
     model: qwen3.5:latest

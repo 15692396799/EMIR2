@@ -1,0 +1,111 @@
+# Same roles as eval_large.yaml, but the judge is DeepSeek's own API instead of
+# OpenRouter's openai/gpt-4o-mini.
+#
+# Why: OpenRouter geo-gates gpt-4o-mini (and intermittently every other model)
+# from this machine -- "This model is not available in your region." DeepSeek's
+# direct endpoint answers from here, is cheap, and is a different vendor from
+# the z-ai/glm-5.1 that builds and answers, so the judge stays independent.
+# The runner roles are untouched, so a run started with eval_large.yaml can be
+# scored with this config (the judge only reads the answers).
+#
+#   python Experiment/run_scoring.py --run-dir Experiment/runs/<run> \
+#     --config Experiment/configs/eval_large_dsjudge.yaml
+#
+# Requires OPENAI_API_KEY and OPENAI_CHAT_COMPLETIONS_ENDPOINT in Experiment/.env
+# pointing at DeepSeek (the provider name is generic OpenAI-compatible).
+
+experiment:
+  track: evaluation
+models:
+  embedding:
+    provider: ollama
+    model: qwen3-embedding
+    base_url_env: OLLAMA_BASE_URL
+    timeout: 600
+  memory_builder: &large_chat
+    provider: openrouter
+    model: z-ai/glm-5.1
+    api_key_env: OPENROUTER_API_KEY
+    chat_completions_endpoint_env: OPENROUTER_CHAT_COMPLETIONS_ENDPOINT
+    temperature: 0.0
+    timeout: 300
+    extra_body:
+      max_tokens: 32768
+      # Same Baidu Qianfan pin as eval_large.yaml.
+      provider:
+        order: ["Baidu"]
+        allow_fallbacks: true
+  adjudication_model: *large_chat
+  answer_model: *large_chat
+  # DeepSeek direct: region-available replacement for the protocol judge.
+  judge_model:
+    provider: openai
+    model: deepseek-chat
+    api_key_env: OPENAI_API_KEY
+    chat_completions_endpoint_env: OPENAI_CHAT_COMPLETIONS_ENDPOINT
+    temperature: 0.0
+    timeout: 120
+    extra_body:
+      max_tokens: 512
+  window_planner: &control_chat
+    provider: ollama
+    model: qwen3.5:latest
+    base_url_env: OLLAMA_BASE_URL
+    temperature: 0.0
+    timeout: 3600
+  entity_judge: *control_chat
+  controller: *control_chat
+  decomposition_gate: *control_chat
+  slm: *control_chat
+memory:
+  backend: v4
+  memory_extraction_batch_turns: 64
+  memory_extraction_workers: 8
+  llm_max_retries: 2
+  llm_retry_backoff_seconds: 1.0
+  include_retrieval_trace_in_answer_prompt: false
+  answer_context_mode: content aware
+  backends:
+    v4:
+      database_path: data/memconflict_eval.sqlite3
+      faiss_path: data/memconflict_eval_faiss
+      memory_builder_model: memory_builder
+      semantic_state_model: null
+      embedding_model: embedding
+      entity_judge_batch_size: 8
+      entity_judge_workers: 2
+      entity_auto_merge_policy: conservative
+      prompt_output_tokens:
+        memory_builder: 32768
+        semantic_reducer: 8192
+        window_boundary: 512
+        entity_judge: 2048
+        cross_window_adjudication: 16384
+      window_planner:
+        mode: model
+        token_encoding: cl100k_base
+        min_builder_input_tokens: 2048
+        target_builder_input_tokens: 12000
+        max_builder_input_tokens: 30000
+        max_window_turns: 0
+        max_window_atoms: 64
+retrieval:
+  strategy: multi_round
+  controller_profile: teacher
+  strategies:
+    multi_round:
+      controller_model: controller
+      controller_max_retries: 2
+      rank_fusion_constant: 60
+      model_evidence_filter_enabled: false
+evaluation:
+  benchmarks:
+  - locomo
+  benchmark_dir: benchmark
+  output_dir: runs
+  locomo:
+    answer_workers: 4
+    answer_chunk_size: 1
+    judge_workers: 4
+    answer_max_retries: 2
+    use_llm_judge: true

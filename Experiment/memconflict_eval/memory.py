@@ -13,7 +13,12 @@ giving each one its own database/FAISS directory and namespace.
 
 from __future__ import annotations
 
+import json
+import os
+import re
 import shutil
+import sqlite3
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +27,24 @@ from typing import Any, Sequence
 from . import runtime
 from .data import Persona, Session
 from .embedding import wrap_embedding_client
+
+
+#: V4 keeps a durable build cache in ``v4_build_checkpoints`` and replays a
+#: ``status='succeeded'`` row whenever the same unit (``checkpoint_key``) is
+#: built again. The loader matches on the key and the status only, so an output
+#: that was validated against an older semantic state is replayed as-is; a
+#: ``reinforce <fact_key>`` operation then references a fact key that no longer
+#: exists (``Memory/BUILD`` -> ``builder.py:2023-2031`` -> ``semantic.py:422``)
+#: and the persona dies. The two switches below let the harness drop those
+#: entries instead of replaying them.
+CHECKPOINT_GUARD_ENV = "MEMCONFLICT_CHECKPOINT_GUARD"
+DEFAULT_CHECKPOINT_STAGE = "semantic_update"
+_STALE_CHECKPOINT_MARKERS = (
+    "references unknown fact key",
+    "references evidence outside supplied local event refs",
+    "resolves to an existing fact key",
+)
+_STAGE_PATTERN = re.compile(r"stage=([A-Za-z_]+)")
 
 
 @dataclass(frozen=True)
@@ -51,6 +74,8 @@ class IngestReport:
     duration_ms: float
     namespace_ready: bool | None = None
     skipped: bool = False
+    stale_checkpoints_dropped: int = 0
+    retried_after_validation_error: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -59,6 +84,8 @@ class IngestReport:
             "Duration_ms": self.duration_ms,
             "Namespace_Ready": self.namespace_ready,
             "Skipped": self.skipped,
+            "Stale_Checkpoints_Dropped": self.stale_checkpoints_dropped,
+            "Retried_After_Validation_Error": self.retried_after_validation_error,
         }
 
 
@@ -97,6 +124,27 @@ def _memory_text(item: Any) -> str:
     if semantic:
         parts.append(f"semantic: {semantic}")
     return " | ".join(parts) or "(empty memory)"
+
+
+def _is_stale_checkpoint_error(error: BaseException) -> bool:
+    """True for the validation failures a stale build cache can produce.
+
+    V4 raises ``SemanticValidationError`` (sometimes wrapped in
+    ``V4BuildStageError``) when a reducer output does not fit the current
+    semantic state; those are exactly the cases where recomputing the unit
+    instead of replaying the cached output fixes the run.
+    """
+    name = type(error).__name__
+    if name not in {"SemanticValidationError", "V4BuildStageError", "V4StageError"}:
+        return False
+    message = str(error)
+    return any(marker in message for marker in _STALE_CHECKPOINT_MARKERS)
+
+
+def _stage_from_error(error: BaseException) -> str | None:
+    """The ``stage=...`` named in a V4 error message, if it carries one."""
+    match = _STAGE_PATTERN.search(str(error))
+    return match.group(1) if match else None
 
 
 def _memory_created_at(item: Any) -> str:
@@ -175,6 +223,41 @@ class MemConflictMemory:
         if not session.dialogue:
             return IngestReport(session.session_id, 0, 0.0, None, skipped=True)
 
+        dropped = self.drop_stale_checkpoints()
+        try:
+            return self._ingest_once(session, dropped=dropped)
+        except Exception as error:  # noqa: BLE001 - re-raised unless the guard applies
+            if not self.checkpoint_guard_enabled() or not _is_stale_checkpoint_error(error):
+                raise
+            invalidated = self.invalidate_checkpoints(
+                stage=_stage_from_error(error) or DEFAULT_CHECKPOINT_STAGE,
+                reason=f"{type(error).__name__}: {error}",
+            )
+            if invalidated <= 0:
+                # The failing stage carried no cache entry; fall back to every
+                # succeeded checkpoint of this namespace. The retry below is
+                # bounded to one attempt either way: the error was fatal
+                # before, and recomputing the session is the only repair.
+                invalidated = self.invalidate_checkpoints(
+                    stage=None, reason=f"{type(error).__name__}: {error}"
+                )
+            print(
+                f"[warn] {type(error).__name__} while ingesting session "
+                f"{session.session_id} of {self.namespace}: invalidated "
+                f"{invalidated} cached checkpoint(s) and retrying once",
+                file=sys.stderr,
+            )
+            return self._ingest_once(
+                session, dropped=dropped + invalidated, retried=True
+            )
+
+    def _ingest_once(
+        self,
+        session: Session,
+        *,
+        dropped: int = 0,
+        retried: bool = False,
+    ) -> IngestReport:
         start = time.perf_counter()
         self.system.ingest_conversation(
             self.namespace,
@@ -197,7 +280,80 @@ class MemConflictMemory:
             message_count=len(session.dialogue),
             duration_ms=duration_ms,
             namespace_ready=ready,
+            stale_checkpoints_dropped=dropped,
+            retried_after_validation_error=retried,
         )
+
+    # -- stale build-cache guard ------------------------------------------
+
+    @staticmethod
+    def checkpoint_guard_enabled() -> bool:
+        """The guard is on unless ``MEMCONFLICT_CHECKPOINT_GUARD=0``."""
+        raw = os.getenv(CHECKPOINT_GUARD_ENV)
+        if raw is None or not str(raw).strip():
+            return True
+        return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+    def drop_stale_checkpoints(self, *, reason: str = "stale_scope_revision") -> int:
+        """Invalidate cached outputs recorded against an older scope revision.
+
+        Called before every session ingest. Within one build the scope revision
+        does not move, so a legitimate checkpoint (written by this session's own
+        earlier attempt) survives; entries from earlier sessions or from a
+        previous run cannot be replayed against a state that has since changed.
+        """
+        if not self.checkpoint_guard_enabled():
+            return 0
+        return self._invalidate_checkpoints(
+            stale_only=True, stage=None, reason=reason
+        )
+
+    def invalidate_checkpoints(self, *, stage: str | None, reason: str) -> int:
+        """Mark this namespace's succeeded build checkpoints as failed."""
+        return self._invalidate_checkpoints(
+            stale_only=False, stage=stage, reason=reason
+        )
+
+    def _invalidate_checkpoints(
+        self, *, stale_only: bool, stage: str | None, reason: str
+    ) -> int:
+        db_path = self.store_dir / "memory.sqlite3"
+        if not db_path.is_file():
+            return 0
+        payload = json.dumps(
+            {"type": "harness_invalidation", "message": str(reason)},
+            ensure_ascii=False,
+        )
+        sql = [
+            "UPDATE v4_build_checkpoints",
+            "SET status='failed', error_json=?",
+            "WHERE namespace=? AND status='succeeded'",
+        ]
+        params: list[Any] = [payload, self.namespace]
+        if stage:
+            sql.append("AND stage=?")
+            params.append(str(stage))
+        if stale_only:
+            sql.append(
+                "AND EXISTS (SELECT 1 FROM v4_participant_scopes s"
+                " WHERE s.id = v4_build_checkpoints.scope_id"
+                " AND v4_build_checkpoints.scope_revision < s.revision)"
+            )
+        try:
+            connection = sqlite3.connect(str(db_path), timeout=10.0)
+        except sqlite3.Error:
+            return 0
+        try:
+            connection.execute("PRAGMA busy_timeout=10000")
+            cursor = connection.execute(" ".join(sql), params)
+            count = int(cursor.rowcount) if cursor.rowcount and cursor.rowcount > 0 else 0
+            connection.commit()
+            return count
+        except sqlite3.Error:
+            connection.rollback()
+            return 0
+        finally:
+            connection.close()
 
     # -- retrieval ---------------------------------------------------------
 

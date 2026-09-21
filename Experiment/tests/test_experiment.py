@@ -11,10 +11,15 @@ only.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
+import sqlite3
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -40,6 +45,7 @@ from memconflict_eval.judging import (  # noqa: E402
 )
 from memconflict_eval.memory import MemConflictMemory, RetrievedMemory, store_dir_for  # noqa: E402
 from memconflict_eval import ollama_units, parallel  # noqa: E402
+from memconflict_eval.progress import ProgressReporter  # noqa: E402
 from memconflict_eval.embedding import (  # noqa: E402
     BatchedEmbeddingClient,
     _is_transient,
@@ -48,8 +54,12 @@ from memconflict_eval.embedding import (  # noqa: E402
 )
 from memconflict_eval.metrics import (  # noqa: E402
     aggregate,
+    aggregate_by_k,
     render_detail_table,
     render_table3,
+    render_table5,
+    render_table6,
+    render_white_box_by_k,
     srs_from_rank,
 )
 from memconflict_eval.prompts import (  # noqa: E402
@@ -429,6 +439,271 @@ class MetricTests(unittest.TestCase):
             self.assertIn(label, detail)
 
 
+def _markdown_cells(line):
+    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+
+def _sample_judge_rows():
+    """Four judged questions covering all three conflict types."""
+    return [
+        {"conflict_type": "dynamic_conflict", "answer_accuracy": 1.0,
+         "support_rank": 1, "conflict_handling": 1},
+        {"conflict_type": "dynamic_conflict", "answer_accuracy": 0.5,
+         "support_rank": 4, "conflict_handling": 0},
+        {"conflict_type": "static_conflict", "answer_accuracy": 0.0,
+         "support_rank": 2, "conflict_handling": 1},
+        {"conflict_type": "conditional_conflict", "answer_accuracy": 1.0,
+         "support_rank": 3, "conflict_handling": 0},
+    ]
+
+
+class Table5Table6Tests(unittest.TestCase):
+    """Tables 5 and 6 are re-projections of the Table 3 judge pass."""
+
+    def test_table5_reports_uocs_and_crs(self):
+        metrics = aggregate(_sample_judge_rows())
+        header, separator, row = render_table5(metrics, "EMIR²").splitlines()
+        self.assertEqual(
+            _markdown_cells(header),
+            ["Method", "Dynamic AA↑", "Dynamic UOCS↑", "Static AA↑",
+             "Static CRS↑", "Conditional AA↑", "Average AA↑"],
+        )
+        cells = _markdown_cells(row)
+        self.assertEqual(cells[0], "EMIR²")
+        # Dynamic UOCS is the dynamic conflict-handling mean ...
+        self.assertEqual(cells[2], "0.5000")
+        # ... and CRS the static one, not the static answer accuracy.
+        self.assertEqual(cells[3], "0.0000")
+        self.assertEqual(cells[4], "1.0000")
+
+    def test_table6_reports_seh_and_srs_per_conflict_type(self):
+        metrics = aggregate(_sample_judge_rows())
+        header, _, row = render_table6(metrics, "EMIR²").splitlines()
+        self.assertEqual(
+            _markdown_cells(header),
+            ["Method", "Dynamic SEH@3↑", "Dynamic SRS↑", "Static SEH@3↑",
+             "Static SRS↑", "Conditional SEH@3↑", "Conditional SRS↑",
+             "Average SEH@3↑", "Average SRS↑"],
+        )
+        cells = _markdown_cells(row)
+        self.assertEqual(cells[1], "0.5000")  # rank 1 hit, rank 4 miss
+        self.assertEqual(cells[2], "0.5000")  # (1.0 + 0.0) / 2
+        self.assertEqual(cells[3], "1.0000")  # static rank 2 is a hit
+        self.assertAlmostEqual(float(cells[4]), srs_from_rank(2), places=4)
+        self.assertEqual(cells[7], "0.8333")  # average SEH@3
+
+    def test_the_three_tables_share_their_overlapping_cells(self):
+        metrics = aggregate(_sample_judge_rows())
+        table3 = _markdown_cells(render_table3(metrics, "EMIR²").splitlines()[2])
+        table5 = _markdown_cells(render_table5(metrics, "EMIR²").splitlines()[2])
+        table6 = _markdown_cells(render_table6(metrics, "EMIR²").splitlines()[2])
+        # AA columns of Table 5 must equal the AA columns of Table 3 (and the
+        # average), because both read the same judged accuracy.
+        self.assertEqual([table5[1], table5[3], table5[5], table5[6]],
+                         [table3[1], table3[3], table3[5], table3[7]])
+        # SEH@3 columns of Table 6 must equal Table 3's white-box columns.
+        self.assertEqual([table6[1], table6[3], table6[5]], [table3[2], table3[4], table3[6]])
+
+    def test_white_box_windows_are_cut_from_one_support_rank(self):
+        rows = [
+            {"conflict_type": "dynamic_conflict", "answer_accuracy": 1.0,
+             "support_rank": 4, "conflict_handling": 1},
+        ]
+        by_k = aggregate_by_k(rows, [2, 3, 5])
+        dynamic = {key: value.by_conflict_type["dynamic_conflict"] for key, value in by_k.items()}
+        self.assertEqual(dynamic["2"].seh_at_3, 0.0)
+        self.assertEqual(dynamic["3"].seh_at_3, 0.0)
+        self.assertEqual(dynamic["5"].seh_at_3, 1.0)
+        self.assertEqual(dynamic["3"].srs, 0.0)
+        self.assertAlmostEqual(dynamic["5"].srs, srs_from_rank(4))
+        # AA never moves with the white-box window.
+        self.assertEqual(dynamic["2"].answer_accuracy, dynamic["5"].answer_accuracy)
+
+    def test_by_k_table_prints_one_row_per_window(self):
+        by_k = aggregate_by_k(_sample_judge_rows(), [2, 3, 5])
+        lines = render_white_box_by_k(by_k, "EMIR²").splitlines()
+        self.assertEqual(len(lines), 5)  # header + separator + three windows
+        self.assertEqual([_markdown_cells(line)[1] for line in lines[2:]], ["@2", "@3", "@5"])
+
+    def test_conditional_rows_have_no_conflict_handling_diagnostic(self):
+        metrics = aggregate(_sample_judge_rows())
+        self.assertIsNone(metrics.by_conflict_type["conditional_conflict"].conflict_handling)
+        # Dynamic and static keep theirs (UOCS / CRS).
+        self.assertIsNotNone(metrics.by_conflict_type["dynamic_conflict"].conflict_handling)
+        self.assertIsNotNone(metrics.by_conflict_type["static_conflict"].conflict_handling)
+
+    def test_scoring_judges_each_question_once_for_all_three_tables(self):
+        from run_scoring import score_persona
+
+        calls = []
+
+        class _CountingJudge:
+            top_k = 5
+
+            def judge(self, question, model_answer, memories):
+                from memconflict_eval.judging import JudgeResult
+
+                calls.append(question.question_id)
+                return JudgeResult(
+                    answer_accuracy=1.0,
+                    conflict_handling=1,
+                    support_rank=2,
+                    reasoning="ok",
+                    duration_ms=1.0,
+                    raw_response="{}",
+                )
+
+        persona = {
+            "Persona_ID": "p",
+            "Sessions": [
+                {
+                    "Session_ID": 1,
+                    "Questions": [
+                        {"question_id": "Q_1", "conflict_type": "dynamic_conflict",
+                         "Model_Answer": "a", "Retrieved_Memories": []},
+                        {"question_id": "Q_2", "conflict_type": "static_conflict",
+                         "Model_Answer": "b", "Retrieved_Memories": []},
+                        {"question_id": "Q_3", "conflict_type": "conditional_conflict",
+                         "Model_Answer": "c", "Retrieved_Memories": []},
+                    ],
+                }
+            ],
+        }
+
+        _, flat = score_persona(persona, judge=_CountingJudge(), top_k=5)
+        self.assertEqual(len(calls), 3)  # one judge call per question, no more
+        metrics = aggregate(flat, white_box_k=3)
+        for table in (render_table3(metrics), render_table5(metrics), render_table6(metrics)):
+            self.assertIn("EMIR²", table)
+
+    def test_scoring_cli_defaults_keep_judging_at_the_primary_window(self):
+        from run_scoring import build_arg_parser, parse_k_values
+
+        defaults = build_arg_parser().parse_args(["--run-dir", "run"])
+        self.assertEqual(defaults.top_k, 3)
+        self.assertIsNone(defaults.white_box_k)
+        self.assertIsNone(defaults.judge_top_k)
+        self.assertEqual(parse_k_values("2,3,5"), [2, 3, 5])
+        self.assertEqual(parse_k_values("5,3,3"), [3, 5])
+        with self.assertRaises(ValueError):
+            parse_k_values("0")
+
+    def test_rebuild_tool_reproduces_the_scoring_pipeline(self):
+        from tools.rebuild_tables import rows_from_scored_personas
+
+        personas = [
+            {
+                "Persona_ID": "p",
+                "Sessions": [
+                    {
+                        "Questions": [
+                            {"question_id": "Q_1", "conflict_type": "dynamic_conflict",
+                             "Evaluation": {"Answer_Accuracy": 1.0, "Conflict_Handling": 1,
+                                            "Support_Rank": 1, "Judge_Error": None}},
+                            {"question_id": "Q_2", "conflict_type": "static_conflict",
+                             "Evaluation": {"Answer_Accuracy": 0.5, "Conflict_Handling": 0,
+                                            "Support_Rank": 4, "Judge_Error": None}},
+                        ]
+                    }
+                ],
+            }
+        ]
+        rows = rows_from_scored_personas(personas)
+        self.assertEqual(len(rows), 2)
+        metrics = aggregate(rows, white_box_k=3)
+        self.assertEqual(metrics.by_conflict_type["dynamic_conflict"].answer_accuracy, 1.0)
+        # Rank 4 is outside the Top-3 window, so the static row is a miss.
+        self.assertEqual(metrics.by_conflict_type["static_conflict"].seh_at_3, 0.0)
+        # A question without an Evaluation is counted as a judged failure
+        # instead of silently disappearing from the denominator.
+        rows = rows_from_scored_personas(
+            [{"Sessions": [{"Questions": [{"conflict_type": "dynamic_conflict"}]}]}]
+        )
+        self.assertEqual(aggregate(rows).by_conflict_type["dynamic_conflict"].question_count, 1)
+        self.assertEqual(aggregate(rows).judge_error_count, 1)
+
+    def test_rebuild_tool_writes_all_three_tables_from_scores_only(self):
+        from tools import rebuild_tables
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            personas = [
+                {
+                    "Persona_ID": "p",
+                    "Sessions": [
+                        {
+                            "Questions": [
+                                {"question_id": f"Q_{index}", "conflict_type": conflict_type,
+                                 "Evaluation": {"Answer_Accuracy": 1.0,
+                                                "Conflict_Handling": 1, "Support_Rank": 2,
+                                                "Judge_Error": None}}
+                                for index, conflict_type in enumerate(CONFLICT_TYPES)
+                            ]
+                        }
+                    ],
+                }
+            ]
+            with open(run_dir / "scores.jsonl", "w", encoding="utf-8") as handle:
+                for persona in personas:
+                    handle.write(json.dumps(persona) + "\n")
+            # A Top-3 judging pass, as recorded by run_scoring.py.
+            (run_dir / "metrics.json").write_text(
+                json.dumps({"Judge_Top_K": 3}), encoding="utf-8"
+            )
+
+            code = rebuild_tables.main(["--run-dir", str(run_dir), "--white-box-k", "2,3,5"])
+
+            self.assertEqual(code, 0)
+            for name in ("table3.md", "table5.md", "table6.md", "tables.md"):
+                self.assertTrue((run_dir / name).is_file(), name)
+            table3 = (run_dir / "table3.md").read_text(encoding="utf-8")
+            table5 = (run_dir / "table5.md").read_text(encoding="utf-8")
+            table6 = (run_dir / "table6.md").read_text(encoding="utf-8")
+            self.assertIn("Dynamic AA↑", table3)
+            self.assertIn("Dynamic UOCS↑", table5)
+            self.assertIn("Dynamic SRS↑", table6)
+            # Same judging pass, so the overlapping cells must agree exactly.
+            row3 = _markdown_cells(table3.splitlines()[2])
+            row5 = _markdown_cells(table5.splitlines()[2])
+            row6 = _markdown_cells(table6.splitlines()[2])
+            self.assertEqual([row5[1], row5[3], row5[5]], [row3[1], row3[3], row3[5]])
+            self.assertEqual([row6[1], row6[3], row6[5]], [row3[2], row3[4], row3[6]])
+
+    def test_rebuild_tool_refuses_rows_without_a_conflict_type(self):
+        from tools import rebuild_tables
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            persona = {
+                "Persona_ID": "p",
+                "Sessions": [
+                    {"Questions": [{"question_id": "Q_1", "conflict_type": "",
+                                    "Evaluation": {"Answer_Accuracy": 1.0}}]}
+                ],
+            }
+            (run_dir / "scores.jsonl").write_text(json.dumps(persona) + "\n", encoding="utf-8")
+            code = rebuild_tables.main(["--run-dir", str(run_dir)])
+            self.assertEqual(code, 2)
+            self.assertFalse((run_dir / "table3.md").is_file())
+
+    def test_rebuild_tool_reports_the_recorded_judge_window(self):
+        from tools.rebuild_tables import recorded_judge_window
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            scores = run_dir / "scores.jsonl"
+            scores.write_text("", encoding="utf-8")
+            self.assertIsNone(recorded_judge_window(scores))
+            (run_dir / "metrics.json").write_text(
+                json.dumps({"White_Box_Top_K": 3}), encoding="utf-8"
+            )
+            self.assertEqual(recorded_judge_window(scores), 3)
+            (run_dir / "metrics.json").write_text(
+                json.dumps({"Judge_Top_K": 5}), encoding="utf-8"
+            )
+            self.assertEqual(recorded_judge_window(scores), 5)
+
+
 # ---------------------------------------------------------------------------
 # memory adapter (point 7, without the real backend)
 # ---------------------------------------------------------------------------
@@ -750,6 +1025,176 @@ class SessionFallbackTests(unittest.TestCase):
         self.assertEqual(personas[0]["Answered_Question_Count"], 1)
         self.assertEqual(personas[1]["Answered_Question_Count"], 2)
         self.assertTrue(personas[0]["Rebuilt_From_Sessions_JSONL"])
+
+    def test_a_resumed_record_gets_its_earlier_sessions_back(self):
+        """--resume rewrites a persona with only the sessions it replayed.
+
+        The already-answered earlier sessions live in sessions.jsonl; dropping
+        them shrank the scored sample silently (2026-09-20: 44 of 46 questions).
+        """
+        from run_scoring import merge_personas_with_sessions
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sessions.jsonl"
+            rows = [
+                {
+                    "Persona_ID": "p1",
+                    "Memory_System": "retrival_mem_v4",
+                    "Session_ID": session_id,
+                    "Date": f"2022-01-{session_id + 1:02d}",
+                    "Ingest": {"Session_ID": session_id},
+                    "Questions": (
+                        [{"question_id": "Q_001"}]
+                        if session_id in (5, 7)
+                        else []
+                    ),
+                }
+                for session_id in range(0, 11)
+            ]
+            with open(path, "w", encoding="utf-8") as handle:
+                for row in rows:
+                    handle.write(json.dumps(row) + "\n")
+
+            resumed = {
+                "Persona_ID": "p1",
+                "Memory_System": "retrival_mem_v4",
+                "Session_Count": 5,
+                "Answered_Question_Count": 1,
+                "Sessions": [
+                    {
+                        "Session_ID": session_id,
+                        "Date": f"2022-01-{session_id + 1:02d}",
+                        "Questions": ([{"question_id": "Q_001"}] if session_id == 7 else []),
+                    }
+                    for session_id in (6, 7, 8, 9, 10)
+                ],
+            }
+            merged, recovered = merge_personas_with_sessions([resumed], path)
+
+        persona = merged[0]
+        self.assertEqual(recovered, [])  # it is not a rebuilt persona
+        self.assertEqual([s["Session_ID"] for s in persona["Sessions"]], list(range(11)))
+        self.assertEqual(persona["Answered_Question_Count"], 2)
+        self.assertEqual(persona["Session_Count"], 11)
+        self.assertEqual(persona["Merged_Sessions_From_JSONL"], [0, 1, 2, 3, 4, 5])
+
+    def test_merging_twice_changes_nothing(self):
+        from run_scoring import merge_personas_with_sessions
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sessions.jsonl"
+            with open(path, "w", encoding="utf-8") as handle:
+                for session_id in (0, 1):
+                    handle.write(
+                        json.dumps(
+                            {
+                                "Persona_ID": "p1",
+                                "Session_ID": session_id,
+                                "Date": f"2022-01-0{session_id + 1}",
+                                "Questions": [],
+                            }
+                        )
+                        + "\n"
+                    )
+            complete = {
+                "Persona_ID": "p1",
+                "Sessions": [{"Session_ID": 0}, {"Session_ID": 1}],
+                "Answered_Question_Count": 0,
+                "Session_Count": 2,
+            }
+            once, _ = merge_personas_with_sessions([complete], path)
+            twice, _ = merge_personas_with_sessions(once, path)
+
+        self.assertEqual([s["Session_ID"] for s in twice[0]["Sessions"]], [0, 1])
+        self.assertNotIn("Merged_Sessions_From_JSONL", twice[0])
+
+
+class ScoringMainTests(unittest.TestCase):
+    """run_scoring writes the tables plus the traceability fields."""
+
+    def test_metrics_record_the_judge_and_partial_coverage(self):
+        from run_scoring import main as scoring_main
+
+        judge_reply = json.dumps(
+            {
+                "answer_accuracy": 1.0,
+                "conflict_handling": 1,
+                "support_rank": 1,
+                "reasoning": "supported by the first memory",
+            }
+        )
+        saved = _save_env("OPENROUTER_API_KEY", "OPENROUTER_CHAT_COMPLETIONS_ENDPOINT")
+        original_loader = runtime.load_memory_config
+        original_builder = runtime.build_chat_client
+        runtime.load_memory_config = lambda config_path=None: SimpleNamespace(
+            judge_model=SimpleNamespace(
+                provider="openrouter", model="openai/gpt-4o-mini", role="judge"
+            )
+        )
+        runtime.build_chat_client = lambda model_config: _FakeChatClient(judge_reply)
+        os.environ["OPENROUTER_API_KEY"] = "test-key"
+        os.environ["OPENROUTER_CHAT_COMPLETIONS_ENDPOINT"] = "https://example.invalid/chat"
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                run_dir = Path(tmp) / "merged"
+                run_dir.mkdir()
+                (run_dir / "results.jsonl").write_text(
+                    json.dumps(
+                        {
+                            "Persona_ID": "persona-0",
+                            "Memory_System": "retrival_mem_v4",
+                            "Sessions": [
+                                {
+                                    "Session_ID": 0,
+                                    "Questions": [
+                                        {
+                                            "question_id": "Q_001",
+                                            "question": "Where does the user live?",
+                                            "answer": "Melbourne.",
+                                            "conflict_type": "dynamic_conflict",
+                                            "Model_Answer": "Melbourne.",
+                                            "Retrieved_Memories": [
+                                                {
+                                                    "rank": 1,
+                                                    "memory": "moved to Melbourne",
+                                                    "created_at": "2022-02-25",
+                                                    "score": 0.9,
+                                                }
+                                            ],
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                (run_dir / "run_meta.json").write_text(
+                    json.dumps(
+                        {
+                            "Persona_Unit_Assignments": {"persona-0": None},
+                            "Personas_Expected_From_Dataset": 30,
+                            "Partial_Merge": True,
+                            "Shards_Merged": [str(run_dir.parent / "shard_1")],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                with contextlib.redirect_stderr(io.StringIO()):
+                    code = scoring_main(["--run-dir", str(run_dir)])
+                metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(code, 0)
+            self.assertEqual(metrics["Judge_Model"], "openai/gpt-4o-mini")
+            self.assertEqual(metrics["Judge_Provider"], "openrouter")
+            self.assertTrue(metrics["Partial_Merge"])
+            self.assertEqual(metrics["Dataset_Personas_Expected"], 30)
+            self.assertEqual(metrics["Personas_Scored"], 1)
+        finally:
+            runtime.load_memory_config = original_loader
+            runtime.build_chat_client = original_builder
+            _restore_env(saved)
 
 
 class ScoringPipelineTests(unittest.TestCase):
@@ -1226,6 +1671,7 @@ class RunnerMainWiringTests(unittest.TestCase):
                         "1",
                         "--max-sessions",
                         "2",
+                        "--no-progress",
                     ]
                 )
                 self.assertEqual(code, 0)
@@ -1357,6 +1803,2073 @@ class PersonaJobTests(unittest.TestCase):
             .ollama_units,
             "http://gpu:1,http://gpu:2",
         )
+
+
+class _FakeRetrievalReport:
+    def __init__(self, memories):
+        self.memories = memories
+        self.round_count = 1
+        self.duration_ms = 5.0
+
+
+class _FakeAnswer:
+    def __init__(self, text="ans"):
+        self.text = text
+        self.duration_ms = 3.0
+
+
+class _FakeRetrievalMemory:
+    """Minimal stand-in for MemConflictMemory used by the QA scheduler."""
+
+    namespace = "memconflict:test:v1"
+
+    def __init__(self, delay=0.0, fail_on=()):
+        self.delay = delay
+        self.fail_on = set(fail_on)
+        self._lock = threading.Lock()
+        self.in_flight = 0
+        self.max_in_flight = 0
+
+    def retrieve(self, question, *, keep=None):
+        with self._lock:
+            self.in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        try:
+            time.sleep(self.delay)
+            if question in self.fail_on:
+                raise RuntimeError(f"retrieval exploded on {question}")
+            return _FakeRetrievalReport(
+                [
+                    RetrievedMemory(
+                        rank=1, memory=question, created_at="2022-01-01", score=1.0
+                    )
+                ]
+            )
+        finally:
+            with self._lock:
+                self.in_flight -= 1
+
+
+class _FakeAnswerer:
+    def answer(self, question, memories, *, namespace="", memory_context=None):
+        return _FakeAnswer(f"answer to {question.question}")
+
+
+def _questions_persona(count=4):
+    raw = {
+        "ID": "persona-qa",
+        "Full_Session_Chain": [
+            {
+                "Session_ID": 0,
+                "Date": "2022-01-03",
+                "Session_Type": "initial_reveal",
+                "Session_Dialogue": {
+                    "dialogue_turn_1": [{"role": "user", "content": "hello"}],
+                },
+                "Session_Questions": [
+                    {
+                        "question_id": f"Q_{index:03d}",
+                        "question": f"question {index}",
+                        "answer": "gold",
+                        "conflict_type": "dynamic_conflict",
+                        "ability_target": "track_state_over_time",
+                        "difficulty": "easy",
+                    }
+                    for index in range(count)
+                ],
+            }
+        ],
+    }
+    return parse_persona(raw)
+
+
+class ParallelAnsweringTests(unittest.TestCase):
+    """Point 17b: one session's questions answer side by side."""
+
+    def test_serial_worker_count_keeps_the_original_loop(self):
+        from run_experiment import answer_session_questions
+
+        memory = _FakeRetrievalMemory(delay=0.05)
+        session = _questions_persona(3).sessions[0]
+        rows = answer_session_questions(
+            memory=memory,
+            answerer=_FakeAnswerer(),
+            session=session,
+            top_k=3,
+            stored_top_k=5,
+            workers=1,
+        )
+        self.assertEqual([row["question_id"] for row in rows], ["Q_000", "Q_001", "Q_002"])
+        self.assertEqual(memory.max_in_flight, 1)
+
+    def test_questions_run_concurrently_and_keep_their_order(self):
+        from run_experiment import answer_session_questions
+
+        memory = _FakeRetrievalMemory(delay=0.2)
+        session = _questions_persona(4).sessions[0]
+        started = time.perf_counter()
+        rows = answer_session_questions(
+            memory=memory,
+            answerer=_FakeAnswerer(),
+            session=session,
+            top_k=3,
+            stored_top_k=5,
+            workers=4,
+        )
+        elapsed = time.perf_counter() - started
+        self.assertEqual(
+            [row["question_id"] for row in rows],
+            ["Q_000", "Q_001", "Q_002", "Q_003"],
+        )
+        self.assertEqual(memory.max_in_flight, 4)
+        self.assertLess(elapsed, 0.6)  # serial would need >= 0.8 s
+
+    def test_one_bad_question_does_not_lose_the_others(self):
+        from run_experiment import answer_session_questions
+
+        memory = _FakeRetrievalMemory(delay=0.0, fail_on={"question 1"})
+        session = _questions_persona(3).sessions[0]
+        rows = answer_session_questions(
+            memory=memory,
+            answerer=_FakeAnswerer(),
+            session=session,
+            top_k=3,
+            stored_top_k=5,
+            workers=3,
+        )
+        self.assertEqual(rows[1]["Model_Answer"], "")
+        self.assertIn("retrieval exploded", rows[1]["Answer_Error"])
+        self.assertEqual(rows[0]["Model_Answer"], "answer to question 0")
+        self.assertEqual(rows[2]["Model_Answer"], "answer to question 2")
+
+
+class ResumeTests(unittest.TestCase):
+    def test_completed_sessions_are_read_from_the_progress_log(self):
+        from run_experiment import load_completed_sessions
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sessions.jsonl"
+            path.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"Persona_ID": "p1", "Session_ID": 0}),
+                        json.dumps({"Persona_ID": "p1", "Session_ID": 1}),
+                        json.dumps({"Persona_ID": "p2", "Session_ID": 0}),
+                        "{not json",
+                        json.dumps({"Persona_ID": "p3", "Session_ID": "7"}),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            completed = load_completed_sessions(path)
+            self.assertEqual(completed["p1"], {0, 1})
+            self.assertEqual(completed["p2"], {0})
+            self.assertNotIn("p3", completed)  # non-integer session ids are ignored
+        self.assertEqual(load_completed_sessions(Path("does-not-exist.jsonl")), {})
+
+    def test_run_persona_skips_finished_sessions(self):
+        from run_experiment import run_persona
+
+        fake_system = _FakeMemorySystem()
+        _patch_runtime(fake_system, _FakeChatClient("ans"), _FakeChatClient())
+        persona = EndToEndOrderingTests()._persona()
+        with tempfile.TemporaryDirectory() as tmp:
+            record = run_persona(
+                persona=persona,
+                output_dir=Path(tmp),
+                config_path=Path("unused.yaml"),
+                answerer=MemConflictAnswerer(),
+                top_k=2,
+                stored_top_k=5,
+                version="v1",
+                keep_memory=True,
+                skip_session_ids=(0,),
+            )
+        self.assertEqual(record["Sessions_Skipped"], 1)
+        self.assertEqual(record["Session_Count"], 1)
+        self.assertEqual([session["Session_ID"] for session in record["Sessions"]], [1])
+        # Only the non-skipped session reached the memory system.
+        self.assertEqual(fake_system.ingested, ["1"])
+
+
+class ConcurrencyOverrideTests(unittest.TestCase):
+    def test_overrides_reach_both_thread_pools(self):
+        saved = _save_env(
+            runtime.EXTRACTION_WORKERS_ENV, runtime.ENTITY_JUDGE_WORKERS_ENV
+        )
+        try:
+            os.environ[runtime.EXTRACTION_WORKERS_ENV] = "2"
+            os.environ[runtime.ENTITY_JUDGE_WORKERS_ENV] = "1"
+            config = SimpleNamespace(
+                memory=SimpleNamespace(
+                    memory_extraction_workers=8,
+                    backends={"v4": {"entity_judge_workers": 2}},
+                )
+            )
+            applied = runtime.apply_concurrency_overrides(config)
+            self.assertEqual(config.memory.memory_extraction_workers, 2)
+            self.assertEqual(config.memory.backends["v4"]["entity_judge_workers"], 1)
+            self.assertEqual(
+                applied,
+                {"memory_extraction_workers": 2, "entity_judge_workers": 1},
+            )
+        finally:
+            _restore_env(saved)
+
+    def test_no_override_leaves_the_config_alone(self):
+        saved = _save_env(
+            runtime.EXTRACTION_WORKERS_ENV, runtime.ENTITY_JUDGE_WORKERS_ENV
+        )
+        try:
+            config = SimpleNamespace(
+                memory=SimpleNamespace(
+                    memory_extraction_workers=8,
+                    backends={"v4": {"entity_judge_workers": 2}},
+                )
+            )
+            self.assertEqual(runtime.apply_concurrency_overrides(config), {})
+            self.assertEqual(config.memory.memory_extraction_workers, 8)
+            self.assertEqual(config.memory.backends["v4"]["entity_judge_workers"], 2)
+        finally:
+            _restore_env(saved)
+
+
+class ScoringMergeTests(unittest.TestCase):
+    """P0-2: a failed persona's finished sessions still reach the table."""
+
+    def test_duplicate_persona_records_are_collapsed(self):
+        """--resume appends; the richer record must win, not both."""
+        from run_scoring import load_personas_from_results
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "results.jsonl"
+            path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {"Persona_ID": "p1", "Answered_Question_Count": 1, "Sessions": []}
+                        ),
+                        json.dumps(
+                            {"Persona_ID": "p1", "Answered_Question_Count": 5, "Sessions": []}
+                        ),
+                        json.dumps(
+                            {"Persona_ID": "p2", "Answered_Question_Count": 2, "Sessions": []}
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            rows = load_personas_from_results(path)
+        self.assertEqual([row["Persona_ID"] for row in rows], ["p1", "p2"])
+        self.assertEqual(rows[0]["Answered_Question_Count"], 5)
+
+    @staticmethod
+    def _session_row(persona_id, session_id, questions=1):
+        return {
+            "Persona_ID": persona_id,
+            "Memory_System": "retrival_mem_v4",
+            "Session_ID": session_id,
+            "Date": "2022-01-03",
+            "Session_Type": "update",
+            "Questions": [
+                {
+                    "question_id": f"Q_{index}",
+                    "conflict_type": "dynamic_conflict",
+                    "Model_Answer": "ans",
+                }
+                for index in range(questions)
+            ],
+        }
+
+    def test_missing_personas_are_rebuilt_and_merged(self):
+        from run_scoring import merge_personas_with_sessions
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sessions.jsonl"
+            path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(self._session_row("p1", 0)),
+                        json.dumps(self._session_row("p2", 0)),
+                        json.dumps(self._session_row("p2", 1, questions=2)),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            merged, recovered = merge_personas_with_sessions(
+                [{"Persona_ID": "p1", "Sessions": [{"Session_ID": 0, "Questions": []}]}],
+                path,
+            )
+        self.assertEqual([row["Persona_ID"] for row in merged], ["p1", "p2"])
+        self.assertEqual(recovered, ["p2"])
+        p2 = merged[1]
+        self.assertTrue(p2["Rebuilt_From_Sessions_JSONL"])
+        self.assertTrue(p2["Partial_Persona"])
+        self.assertEqual(len(p2["Sessions"]), 2)
+        self.assertEqual(p2["Answered_Question_Count"], 3)
+
+    def test_nothing_to_merge_keeps_the_results_untouched(self):
+        from run_scoring import merge_personas_with_sessions
+
+        rows = [{"Persona_ID": "p1", "Sessions": []}]
+        merged, recovered = merge_personas_with_sessions(
+            rows, Path("missing-sessions.jsonl")
+        )
+        self.assertEqual(merged, rows)
+        self.assertEqual(recovered, [])
+
+
+class ShardMergeTests(unittest.TestCase):
+    """P1-3: sharded runs merge into one scoreable directory."""
+
+    def _shard(self, root: Path, name: str, persona_ids: list[str], wall: float):
+        shard = root / name
+        shard.mkdir(parents=True, exist_ok=True)
+        with open(shard / "results.jsonl", "w", encoding="utf-8") as handle:
+            for persona_id in persona_ids:
+                handle.write(
+                    json.dumps(
+                        {"Persona_ID": persona_id, "Memory_System": "retrival_mem_v4"}
+                    )
+                    + "\n"
+                )
+        with open(shard / "sessions.jsonl", "w", encoding="utf-8") as handle:
+            for persona_id in persona_ids:
+                handle.write(
+                    json.dumps({"Persona_ID": persona_id, "Session_ID": 0}) + "\n"
+                )
+        (shard / "run_meta.json").write_text(
+            json.dumps(
+                {
+                    "Wall_Clock_s": wall,
+                    "Persona_Workers": 4,
+                    "Ollama_Units": ["http://unit:1"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return shard
+
+    def test_clean_shards_merge(self):
+        from tools.merge_shards import merge
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = self._shard(root, "shard_0", ["p1", "p2"], 100.0)
+            second = self._shard(root, "shard_1", ["p3"], 200.0)
+            merged, status = merge([first, second], dataset=None)
+        self.assertEqual(status, 0)
+        self.assertEqual(merged["summary"]["Persona_Count"], 3)
+        self.assertEqual(merged["summary"]["Session_Count"], 3)
+        self.assertEqual(merged["summary"]["Shard_Wall_Clock_Sum_s"], 300.0)
+        self.assertEqual(merged["summary"]["Duplicate_Personas"], [])
+
+    def test_overlapping_shards_are_reported(self):
+        from tools.merge_shards import merge
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = self._shard(root, "shard_0", ["p1", "p2"], 100.0)
+            second = self._shard(root, "shard_1", ["p2", "p3"], 100.0)
+            merged, status = merge([first, second], dataset=None)
+        self.assertEqual(status, 1)
+        self.assertEqual(merged["summary"]["Duplicate_Personas"], ["p2"])
+        self.assertEqual(merged["summary"]["Persona_Count"], 3)
+
+
+def _http_error(status):
+    import requests
+
+    response = SimpleNamespace(status_code=status)
+    return requests.exceptions.HTTPError(f"{status} error", response=response)
+
+
+class RetryWrapperTests(unittest.TestCase):
+    """OpenRouter's geo 403 arrives in bursts; the judge must ride it out."""
+
+    def test_retryable_statuses(self):
+        from memconflict_eval.retrying import is_retryable
+
+        import requests
+
+        for status in (403, 408, 429, 500, 502, 503):
+            self.assertTrue(is_retryable(_http_error(status)), status)
+        for status in (400, 401, 404, 422):
+            self.assertFalse(is_retryable(_http_error(status)), status)
+        self.assertTrue(is_retryable(requests.exceptions.ConnectionError("proxy down")))
+
+    def test_403_then_success_is_retried(self):
+        from memconflict_eval.retrying import RetryingChatClient
+
+        class Flaky:
+            def __init__(self):
+                self.calls = 0
+
+            def chat(self, messages, json_mode=False, json_schema=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise _http_error(403)
+                return "ok"
+
+        sleeps = []
+        inner = Flaky()
+        client = RetryingChatClient(inner, attempts=3, backoff_seconds=0.5, sleeper=sleeps.append)
+        self.assertEqual(client.chat([{"role": "user", "content": "hi"}]), "ok")
+        self.assertEqual(inner.calls, 2)
+        self.assertEqual(client.retry_count, 1)
+        self.assertEqual(sleeps, [0.5])
+
+    def test_a_hard_error_is_not_retried(self):
+        from memconflict_eval.retrying import RetryingChatClient
+
+        class Broken:
+            def __init__(self):
+                self.calls = 0
+
+            def chat(self, messages, json_mode=False, json_schema=None):
+                self.calls += 1
+                raise _http_error(400)
+
+        inner = Broken()
+        client = RetryingChatClient(inner, attempts=3, backoff_seconds=0.0, sleeper=lambda _s: None)
+        with self.assertRaises(Exception):
+            client.chat([{"role": "user", "content": "hi"}])
+        self.assertEqual(inner.calls, 1)
+
+    def test_giving_up_after_the_last_attempt(self):
+        from memconflict_eval.retrying import RetryingChatClient
+
+        class Always:
+            def __init__(self):
+                self.calls = 0
+
+            def chat(self, messages, json_mode=False, json_schema=None):
+                self.calls += 1
+                raise _http_error(403)
+
+        inner = Always()
+        client = RetryingChatClient(inner, attempts=2, backoff_seconds=0.0, sleeper=lambda _s: None)
+        with self.assertRaises(Exception):
+            client.chat([{"role": "user", "content": "hi"}])
+        self.assertEqual(inner.calls, 2)
+
+    def test_env_can_disable_the_wrapper(self):
+        from memconflict_eval.retrying import RetryingChatClient, wrap_retrying
+
+        saved = _save_env("MEMCONFLICT_TEST_CHAT_RETRIES")
+        try:
+            os.environ["MEMCONFLICT_TEST_CHAT_RETRIES"] = "1"
+            plain = object()
+            self.assertIs(wrap_retrying(plain, prefix="MEMCONFLICT_TEST"), plain)
+            os.environ["MEMCONFLICT_TEST_CHAT_RETRIES"] = "4"
+            self.assertIsInstance(
+                wrap_retrying(plain, prefix="MEMCONFLICT_TEST"), RetryingChatClient
+            )
+        finally:
+            _restore_env(saved)
+
+    def test_the_judge_uses_the_retrying_client(self):
+        from memconflict_eval.judging import MemConflictJudge
+
+        _patch_runtime(_FakeMemorySystem(), _FakeChatClient("ans"), _FakeChatClient("{}"))
+        config = runtime.load_memory_config()
+        judge = MemConflictJudge(config, top_k=3)
+        self.assertTrue(
+            type(judge.client).__name__ == "RetryingChatClient",
+            type(judge.client).__name__,
+        )
+
+
+class AzureChannelTests(unittest.TestCase):
+    """The judge can leave OpenRouter's geo gate for Azure OpenAI."""
+
+    def _client(self, **overrides):
+        from memconflict_eval.azure_client import AzureChatClient
+
+        params = dict(
+            endpoint="https://my-res.openai.azure.com",
+            deployment="gpt-4o-mini",
+            api_version="2024-10-21",
+            api_key="secret",
+            temperature=0.0,
+            timeout=30,
+            max_tokens=512,
+        )
+        params.update(overrides)
+        return AzureChatClient(**params)
+
+    def test_endpoint_carries_the_deployment_and_api_version(self):
+        from memconflict_eval.azure_client import build_azure_endpoint
+
+        url = build_azure_endpoint(
+            "https://my-res.openai.azure.com/", "gpt-4o-mini", "2024-10-21"
+        )
+        self.assertEqual(
+            url,
+            "https://my-res.openai.azure.com/openai/deployments/gpt-4o-mini/"
+            "chat/completions?api-version=2024-10-21",
+        )
+
+    def test_an_endpoint_that_already_has_the_path_is_kept(self):
+        from memconflict_eval.azure_client import build_azure_endpoint
+
+        url = build_azure_endpoint(
+            "https://gw.example.com/openai/deployments/judge/chat/completions",
+            "",
+            "2024-10-21",
+        )
+        self.assertTrue(url.endswith("?api-version=2024-10-21"))
+        self.assertNotIn("/deployments//", url)
+
+    def test_chat_uses_the_api_key_header(self):
+        import requests
+
+        client = self._client()
+        captured = {}
+
+        class _Response:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"choices": [{"message": {"content": "ok"}}]}
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            captured.update(url=url, headers=headers, json=json, timeout=timeout)
+            return _Response()
+
+        original = requests.post
+        requests.post = fake_post
+        try:
+            text = client.chat([{"role": "user", "content": "hi"}], json_mode=True)
+        finally:
+            requests.post = original
+
+        self.assertEqual(text, "ok")
+        self.assertEqual(captured["headers"]["api-key"], "secret")
+        self.assertNotIn("Authorization", captured["headers"])
+        self.assertIn("/openai/deployments/gpt-4o-mini/", captured["url"])
+        self.assertEqual(captured["json"]["response_format"], {"type": "json_object"})
+        self.assertEqual(captured["json"]["max_tokens"], 512)
+
+    def test_bearer_mode_is_available_for_gateways(self):
+        import requests
+
+        client = self._client(auth_header="authorization")
+        captured = {}
+
+        class _Response:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"choices": [{"message": {"content": "ok"}}]}
+
+        original = requests.post
+        requests.post = lambda url, headers=None, json=None, timeout=None: (
+            captured.update(headers=headers) or _Response()
+        )
+        try:
+            client.chat([{"role": "user", "content": "hi"}])
+        finally:
+            requests.post = original
+        self.assertEqual(captured["headers"]["Authorization"], "Bearer secret")
+        self.assertNotIn("api-key", captured["headers"])
+
+    def test_missing_endpoint_is_reported_clearly(self):
+        from memconflict_eval.azure_client import (
+            AzureConfigurationError,
+            build_azure_chat_client,
+        )
+
+        saved = _save_env("AZURE_OPENAI_ENDPOINT", "AZURE_API_KEY")
+        try:
+            os.environ.pop("AZURE_OPENAI_ENDPOINT", None)
+            os.environ["AZURE_API_KEY"] = "secret"
+            with self.assertRaises(AzureConfigurationError):
+                build_azure_chat_client(SimpleNamespace(provider="azure", extra={}))
+        finally:
+            _restore_env(saved)
+
+    def test_judge_and_answerer_route_azure_through_our_client(self):
+        calls = []
+        original = runtime.build_chat_client
+        runtime.build_chat_client = lambda model_config: (
+            calls.append(getattr(model_config, "role", "")) or _FakeChatClient("ans")
+        )
+        _patch_runtime(_FakeMemorySystem(), _FakeChatClient("ans"), _FakeChatClient())
+        try:
+            from memconflict_eval.judging import MemConflictJudge
+
+            config = runtime.load_memory_config()
+            MemConflictJudge(config, top_k=3)
+            MemConflictAnswerer(config)
+        finally:
+            runtime.build_chat_client = original
+        self.assertEqual(calls, ["judge", "answer"])
+
+    def test_preflight_follows_the_env_names_a_config_declares(self):
+        config = SimpleNamespace(
+            memory_builder=SimpleNamespace(
+                provider="modelscope_openai_compatible",
+                api_key_env="QIANFAN_API_KEY",
+                chat_completions_endpoint_env="QIANFAN_CHAT_COMPLETIONS_ENDPOINT",
+            ),
+            judge_model=SimpleNamespace(provider="azure"),
+            embedding=None,
+        )
+        names = runtime.required_env_names(
+            config, ("memory_builder", "judge_model")
+        )
+        self.assertIn("QIANFAN_API_KEY", names)
+        self.assertIn("QIANFAN_CHAT_COMPLETIONS_ENDPOINT", names)
+        self.assertIn("AZURE_API_KEY", names)
+        self.assertIn("AZURE_OPENAI_ENDPOINT", names)
+
+
+class NewFlagTests(unittest.TestCase):
+    def test_runner_flags_parse(self):
+        from run_experiment import build_arg_parser
+
+        args = build_arg_parser().parse_args(
+            [
+                "--answer-workers",
+                "8",
+                "--extraction-workers",
+                "2",
+                "--entity-judge-workers",
+                "1",
+                "--resume",
+                "--ollama-units",
+                "http://unit:41134",
+            ]
+        )
+        self.assertEqual(args.answer_workers, 8)
+        self.assertEqual(args.extraction_workers, 2)
+        self.assertEqual(args.entity_judge_workers, 1)
+        self.assertTrue(args.resume)
+        self.assertEqual(args.ollama_units, "http://unit:41134")
+        defaults = build_arg_parser().parse_args([])
+        self.assertEqual(defaults.answer_workers, 4)
+        self.assertFalse(defaults.resume)
+
+    def test_unit_probe_accepts_an_explicit_list(self):
+        from tools.check_ollama_units import parse_base_urls as probe_units
+
+        self.assertEqual(
+            probe_units("http://172.26.94.12:41134,http://172.26.94.12:41135"),
+            ["http://172.26.94.12:41134", "http://172.26.94.12:41135"],
+        )
+
+    def test_unit_probe_reads_ps_with_get(self):
+        """``/api/ps`` is a GET endpoint; POSTing it returns HTTP 405."""
+        from tools import check_ollama_units as probe_tool
+
+        calls = []
+
+        class _FakeResponse:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def read(self):
+                return json.dumps(self._payload).encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+        def fake_urlopen(url, timeout=None):
+            calls.append(url if isinstance(url, str) else "REQUEST-OBJECT")
+            if isinstance(url, str) and url.endswith("/api/ps"):
+                return _FakeResponse(
+                    {"models": [{"name": "qwen3.5:latest", "size_vram": 8_720_000_000}]}
+                )
+            return _FakeResponse({"eval_count": 10, "eval_duration": 1_000_000_000})
+
+        original = probe_tool.urllib.request.urlopen
+        probe_tool.urllib.request.urlopen = fake_urlopen
+        try:
+            row = probe_tool.probe("http://unit:1", "qwen3.5:latest", timeout=5)
+        finally:
+            probe_tool.urllib.request.urlopen = original
+
+        self.assertEqual(row["tokens_per_second"], 10.0)
+        self.assertEqual(row["size_vram_gb"], 8.72)
+        self.assertIn("http://unit:1/api/ps", calls)
+        self.assertTrue(all(isinstance(call, str) for call in calls))
+
+
+# ---------------------------------------------------------------------------
+# progress reporting
+# ---------------------------------------------------------------------------
+
+
+class _Clock:
+    """Injectable monotonic clock, so the ETA maths is testable."""
+
+    def __init__(self, start=1_000.0):
+        self.now = float(start)
+
+    def __call__(self) -> float:
+        return self.now
+
+    def tick(self, seconds: float) -> None:
+        self.now += float(seconds)
+
+
+class _TtyStream(io.StringIO):
+    def isatty(self) -> bool:  # noqa: D102 - mirrors the real stream API
+        return True
+
+
+def _last_line(stream: io.StringIO) -> str:
+    lines = [line for line in stream.getvalue().splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
+class ProgressReporterTests(unittest.TestCase):
+    def test_line_reports_counts_percentage_and_eta(self):
+        clock = _Clock()
+        stream = io.StringIO()
+        progress = ProgressReporter(
+            4,
+            label="sessions",
+            counters={"questions": 0, "errors": 0},
+            totals={"questions": 6, "personas": 4},
+            stream=stream,
+            tty=False,
+            heartbeat=None,
+            log_interval=0.0,
+            clock=clock,
+        )
+        progress.start()
+        clock.tick(60)
+        progress.advance(1, questions=2, errors=0)
+        line = _last_line(stream)
+
+        self.assertIn("[progress]", line)
+        self.assertIn("1/4 sessions", line)
+        self.assertIn("25%", line)
+        self.assertIn("questions 2/6", line)
+        self.assertIn("errors 0", line)
+        # 60 s for one of four sessions leaves three at the same rate.
+        self.assertIn("eta 3m00s", line)
+
+    def test_eta_is_unknown_before_the_first_session(self):
+        stream = io.StringIO()
+        progress = ProgressReporter(
+            3, stream=stream, tty=False, heartbeat=None, log_interval=0.0
+        )
+        progress.start()
+        line = _last_line(stream)
+        self.assertIn("0/3", line)
+        self.assertNotIn("eta", line)
+
+    def test_tty_rewrites_one_line_and_ends_with_a_newline(self):
+        clock = _Clock()
+        stream = _TtyStream()
+        progress = ProgressReporter(
+            2, stream=stream, tty=True, heartbeat=None, interval=0.0, clock=clock
+        )
+        progress.start()
+        clock.tick(5)
+        progress.advance(1)
+        clock.tick(5)
+        progress.finish()
+        text = stream.getvalue()
+
+        self.assertTrue(text.startswith("\r"))
+        self.assertTrue(text.endswith("\n"))
+        self.assertIn("1/2", text)
+        self.assertNotIn("\r\n", text)
+
+    def test_log_lines_are_throttled_to_the_log_interval(self):
+        clock = _Clock()
+        stream = io.StringIO()
+        progress = ProgressReporter(
+            10,
+            stream=stream,
+            tty=False,
+            heartbeat=None,
+            log_interval=60.0,
+            clock=clock,
+        )
+        progress.start()  # the opening line is always written
+        progress.advance(1)
+        progress.advance(1)
+        self.assertEqual(len(stream.getvalue().strip().splitlines()), 1)
+
+        clock.tick(61)
+        progress.advance(1)
+        lines = stream.getvalue().strip().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("3/10", lines[-1])
+
+    def test_disabled_reporting_writes_nothing(self):
+        stream = io.StringIO()
+        progress = ProgressReporter(
+            3, stream=stream, enabled=False, heartbeat=None, tty=False
+        )
+        progress.start()
+        progress.advance(1, questions=2)
+        progress.note(last="persona s1")
+        progress.finish()
+        self.assertEqual(stream.getvalue(), "")
+
+    def test_a_zero_sized_phase_stays_silent(self):
+        stream = io.StringIO()
+        progress = ProgressReporter(0, stream=stream, heartbeat=None, tty=False)
+        progress.start()
+        progress.finish()
+        self.assertEqual(stream.getvalue(), "")
+
+    def test_notes_are_carried_into_the_next_line(self):
+        stream = io.StringIO()
+        progress = ProgressReporter(
+            2, stream=stream, tty=False, heartbeat=None, log_interval=0.0
+        )
+        progress.start()
+        progress.note(running="2/4", last="75345e85 s3")
+        line = _last_line(stream)
+        self.assertIn("running 2/4", line)
+        self.assertIn("last 75345e85 s3", line)
+
+    def test_duration_formatting(self):
+        from memconflict_eval.progress import format_duration
+
+        self.assertEqual(format_duration(9), "9s")
+        self.assertEqual(format_duration(95), "1m35s")
+        self.assertEqual(format_duration(3661), "1h01m")
+        self.assertEqual(format_duration(None), "--")
+        self.assertEqual(format_duration(-1), "--")
+
+    def test_a_narrow_terminal_sheds_the_least_important_pieces(self):
+        stream = io.StringIO()
+        progress = ProgressReporter(
+            44,
+            label="sessions",
+            counters={"questions": 0, "errors": 0, "personas": 0, "failed": 0},
+            totals={"questions": 46, "personas": 4},
+            stream=stream,
+            tty=False,
+            heartbeat=None,
+            log_interval=0.0,
+        )
+        progress.start()
+        progress.advance(12, questions=9)
+        progress.note(running="3/4", last="75345e85 s3")
+
+        wide = progress.render()
+        narrow = progress.render(width=len(wide) - 30)
+        self.assertIn("last 75345e85 s3", wide)
+        self.assertNotIn("last 75345e85 s3", narrow)
+        self.assertLessEqual(len(narrow), len(wide) - 30)
+        # The counter, the question tally and the ETA survive the fitting.
+        self.assertIn("12/44 sessions", narrow)
+        self.assertIn("questions 9/46", narrow)
+
+    def test_fitting_never_drops_the_session_counter(self):
+        stream = io.StringIO()
+        progress = ProgressReporter(
+            10, stream=stream, tty=False, heartbeat=None, log_interval=0.0
+        )
+        progress.start()
+        progress.note(last="persona s9")
+        narrow = progress.render(width=5)
+        self.assertIn("0/10", narrow)
+
+    def test_heartbeat_refreshes_between_sessions_and_stops_on_finish(self):
+        stream = io.StringIO()
+        progress = ProgressReporter(
+            5, stream=stream, tty=False, heartbeat=0.05, log_interval=0.0
+        )
+        progress.start()
+        before = len(stream.getvalue().splitlines())
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if len(stream.getvalue().splitlines()) > before:
+                break
+            time.sleep(0.02)
+        after = len(stream.getvalue().splitlines())
+        progress.finish()
+        self.assertGreater(after, before)
+        self.assertFalse(progress._thread.is_alive())
+
+    def test_log_keeps_the_progress_line_intact_on_a_terminal(self):
+        stream = _TtyStream()
+        progress = ProgressReporter(
+            2, stream=stream, tty=True, heartbeat=None, interval=0.0
+        )
+        progress.start()
+        progress.log("[persona 1/2] persona-aaaa sessions=2 questions=1")
+        progress.advance(1)
+
+        # \r is a line separator for splitlines(), so drop the blank chunks the
+        # in-place rewriting and the padding leave behind.
+        lines = [line for line in stream.getvalue().splitlines() if line.strip()]
+        self.assertIn("[persona 1/2] persona-aaaa sessions=2 questions=1", lines)
+        # The ordinary line is followed by a fresh progress line, not by the
+        # remains of the one it had to clear.
+        self.assertIn("1/2 items", lines[-1])
+        self.assertTrue(all(line.startswith(("[progress]", "[persona")) for line in lines))
+
+    def test_log_still_prints_when_reporting_is_off(self):
+        stream = io.StringIO()
+        progress = ProgressReporter(2, stream=stream, enabled=False, heartbeat=None)
+        progress.log("[persona 1/2] xyz")
+        self.assertEqual(stream.getvalue(), "[persona 1/2] xyz\n")
+
+
+class ExpectedWorkTests(unittest.TestCase):
+    """The progress denominator must match what the runner will replay."""
+
+    def _sessions(self):
+        return [
+            SimpleNamespace(session_id=index, questions=tuple(range(index)))
+            for index in range(5)
+        ]
+
+    def test_full_window(self):
+        from memconflict_eval.progress import expected_work
+
+        self.assertEqual(expected_work(self._sessions()), (5, 10))
+
+    def test_max_sessions_truncates_the_denominator(self):
+        from memconflict_eval.progress import expected_work
+
+        self.assertEqual(expected_work(self._sessions(), max_sessions=3), (3, 3))
+        self.assertEqual(expected_work(self._sessions(), max_sessions=0), (0, 0))
+
+    def test_resume_skips_already_finished_sessions(self):
+        from memconflict_eval.progress import expected_work
+
+        self.assertEqual(
+            expected_work(self._sessions(), skip_session_ids={1, 3}), (3, 6)
+        )
+        self.assertEqual(
+            expected_work(self._sessions(), max_sessions=4, skip_session_ids={1, 3}),
+            (2, 2),
+        )
+
+    def test_runner_totals_aggregate_over_personas(self):
+        from run_experiment import expected_run_work, short_persona_id
+
+        def persona(persona_id, question_counts):
+            return parse_persona(
+                {
+                    "ID": persona_id,
+                    "Full_Session_Chain": [
+                        {
+                            "Session_ID": index,
+                            "Date": f"2022-01-{index + 1:02d}",
+                            "Session_Type": "update",
+                            "Session_Dialogue": {
+                                "dialogue_turn_1": [{"role": "user", "content": "hi"}]
+                            },
+                            "Session_Questions": [
+                                {
+                                    "question_id": f"Q_{index}_{q}",
+                                    "question": "q",
+                                    "answer": "a",
+                                    "conflict_type": "dynamic_conflict",
+                                }
+                                for q in range(count)
+                            ],
+                        }
+                        for index, count in enumerate(question_counts)
+                    ],
+                }
+            )
+
+        first = persona("persona-aaaaaaaa", [0, 2, 1])
+        second = persona("persona-bbbbbbbb", [1])
+        self.assertEqual(expected_run_work([first, second], max_sessions=None), (4, 4))
+        self.assertEqual(expected_run_work([first, second], max_sessions=2), (3, 3))
+        self.assertEqual(
+            expected_run_work(
+                [first, second], max_sessions=None, resume_state={"persona-aaaaaaaa": {1}}
+            ),
+            (3, 2),
+        )
+        self.assertEqual(short_persona_id("75345e85-6427-eb51"), "75345e85")
+        self.assertEqual(short_persona_id("persona-progress"), "persona")
+        self.assertEqual(short_persona_id("ab"), "ab")
+        self.assertEqual(short_persona_id(""), "?")
+
+
+class SemanticValidationError(Exception):
+    """Stand-in for ``memory.v4.semantic.SemanticValidationError``."""
+
+
+class V4BuildStageError(Exception):
+    """Stand-in for ``memory.v4.failure.V4BuildStageError``."""
+
+
+class StaleCheckpointGuardTests(unittest.TestCase):
+    """A stale V4 build-cache entry must not kill a whole persona.
+
+    ``load_build_checkpoint`` matches on the key and ``status='succeeded'``
+    only, so a reducer output validated against an older semantic state is
+    replayed as-is and its ``reinforce <fact_key>`` fails validation. The
+    harness drops those entries (preventively, and once more on failure).
+    """
+
+    def _store(self, tmp: str, *, revision: int, rows) -> Path:
+        db = Path(tmp) / "memory.sqlite3"
+        connection = sqlite3.connect(db)
+        connection.execute(
+            "CREATE TABLE v4_participant_scopes (id TEXT PRIMARY KEY, revision INTEGER)"
+        )
+        connection.execute(
+            "CREATE TABLE v4_build_checkpoints ("
+            "checkpoint_key TEXT PRIMARY KEY, namespace TEXT, scope_id TEXT,"
+            "scope_revision INTEGER, stage TEXT, unit_id TEXT, status TEXT,"
+            "error_json TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO v4_participant_scopes VALUES ('scope_x', ?)", (revision,)
+        )
+        for key, row_revision, stage, status in rows:
+            connection.execute(
+                "INSERT INTO v4_build_checkpoints VALUES (?,?,?,?,?,?,?,NULL)",
+                (key, "ns", "scope_x", row_revision, stage, key, status),
+            )
+        connection.commit()
+        connection.close()
+        return db
+
+    def _memory(self, tmp: str) -> MemConflictMemory:
+        memory = object.__new__(MemConflictMemory)
+        memory.store_dir = Path(tmp)
+        memory.namespace = "ns"
+        memory.persona = SimpleNamespace(persona_id="persona-guard")
+        return memory
+
+    def _statuses(self, db: Path) -> dict[str, str]:
+        connection = sqlite3.connect(db)
+        try:
+            return {
+                row[0]: row[1]
+                for row in connection.execute(
+                    "SELECT checkpoint_key, status FROM v4_build_checkpoints"
+                )
+            }
+        finally:
+            connection.close()
+
+    def setUp(self):
+        self._saved_guard = os.environ.pop("MEMCONFLICT_CHECKPOINT_GUARD", None)
+
+    def tearDown(self):
+        os.environ.pop("MEMCONFLICT_CHECKPOINT_GUARD", None)
+        if self._saved_guard is not None:
+            os.environ["MEMCONFLICT_CHECKPOINT_GUARD"] = self._saved_guard
+
+    def test_checkpoints_from_an_older_scope_revision_are_dropped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._store(
+                tmp,
+                revision=6,
+                rows=[
+                    ("stale", 5, "semantic_update", "succeeded"),
+                    ("fresh", 6, "semantic_update", "succeeded"),
+                    ("already_failed", 4, "semantic_update", "failed"),
+                ],
+            )
+            dropped = self._memory(tmp).drop_stale_checkpoints()
+            statuses = self._statuses(db)
+
+        self.assertEqual(dropped, 1)
+        self.assertEqual(statuses["stale"], "failed")
+        self.assertEqual(statuses["fresh"], "succeeded")
+        self.assertEqual(statuses["already_failed"], "failed")
+
+    def test_invalidation_can_target_one_stage_or_everything(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._store(
+                tmp,
+                revision=3,
+                rows=[
+                    ("sem", 3, "semantic_update", "succeeded"),
+                    ("win", 3, "window_extraction", "succeeded"),
+                ],
+            )
+            memory = self._memory(tmp)
+            self.assertEqual(
+                memory.invalidate_checkpoints(stage="semantic_update", reason="test"), 1
+            )
+            middle = self._statuses(db)
+            self.assertEqual(middle["sem"], "failed")
+            self.assertEqual(middle["win"], "succeeded")
+            self.assertEqual(memory.invalidate_checkpoints(stage=None, reason="test"), 1)
+            self.assertEqual(self._statuses(db)["win"], "failed")
+
+    def test_guard_can_be_switched_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._store(
+                tmp, revision=6, rows=[("stale", 5, "semantic_update", "succeeded")]
+            )
+            os.environ["MEMCONFLICT_CHECKPOINT_GUARD"] = "0"
+            dropped = self._memory(tmp).drop_stale_checkpoints()
+            statuses = self._statuses(db)
+
+        self.assertEqual(dropped, 0)
+        self.assertEqual(statuses["stale"], "succeeded")
+
+    def test_a_missing_store_is_tolerated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = self._memory(tmp)
+            self.assertEqual(memory.drop_stale_checkpoints(), 0)
+            self.assertEqual(memory.invalidate_checkpoints(stage=None, reason="x"), 0)
+
+    def test_only_stale_cache_errors_are_recognised(self):
+        from memconflict_eval.memory import _is_stale_checkpoint_error, _stage_from_error
+
+        self.assertTrue(
+            _is_stale_checkpoint_error(
+                SemanticValidationError("reinforce references unknown fact key")
+            )
+        )
+        self.assertTrue(
+            _is_stale_checkpoint_error(
+                V4BuildStageError(
+                    "V4 operation failed (stage=semantic_update, attempts=3, "
+                    "cause=SemanticValidationError: reinforce references unknown fact key)"
+                )
+            )
+        )
+        self.assertFalse(_is_stale_checkpoint_error(RuntimeError("proxy is down")))
+        self.assertFalse(
+            _is_stale_checkpoint_error(SemanticValidationError("some other failure"))
+        )
+        self.assertEqual(
+            _stage_from_error(
+                V4BuildStageError("V4 operation failed (stage=window_extraction, ...)")
+            ),
+            "window_extraction",
+        )
+        self.assertIsNone(_stage_from_error(RuntimeError("no stage here")))
+
+    def test_a_stale_cache_failure_is_invalidated_and_retried_once(self):
+        class FakeSystem:
+            def __init__(self):
+                self.calls = 0
+
+            def ingest_conversation(self, namespace, conversation, metadata=None, **_k):
+                self.calls += 1
+                if self.calls == 1:
+                    raise SemanticValidationError("reinforce references unknown fact key")
+
+            def is_namespace_ready(self, namespace):
+                return True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._store(
+                tmp,
+                revision=6,
+                rows=[("stale", 5, "semantic_update", "succeeded")],
+            )
+            memory = self._memory(tmp)
+            memory.system = FakeSystem()
+            session = SimpleNamespace(
+                session_id=7,
+                date="2022-03-09",
+                session_type="chitchat",
+                dialogue=("a", "b"),
+                to_memory_session=lambda: {"session_id": "7", "turns": []},
+            )
+            report = memory.ingest_session(session)
+
+        self.assertEqual(memory.system.calls, 2)
+        self.assertTrue(report.retried_after_validation_error)
+        self.assertEqual(report.stale_checkpoints_dropped, 1)
+        self.assertEqual(report.session_id, 7)
+        self.assertTrue(report.to_dict()["Retried_After_Validation_Error"])
+
+    def test_unrelated_failures_are_not_retried(self):
+        class FakeSystem:
+            def __init__(self):
+                self.calls = 0
+
+            def ingest_conversation(self, namespace, conversation, metadata=None, **_k):
+                self.calls += 1
+                raise RuntimeError("proxy is down")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._store(tmp, revision=1, rows=[])
+            memory = self._memory(tmp)
+            memory.system = FakeSystem()
+            session = SimpleNamespace(
+                session_id=1,
+                date="2022-01-10",
+                session_type="initial_reveal",
+                dialogue=("a",),
+                to_memory_session=lambda: {"session_id": "1", "turns": []},
+            )
+            with self.assertRaises(RuntimeError):
+                memory.ingest_session(session)
+
+        self.assertEqual(memory.system.calls, 1)
+
+
+class PersonaShardTests(unittest.TestCase):
+    """Point 27: random persona shards, merged later (possibly on other hosts)."""
+
+    def _write_dataset(self, path: Path, personas: int = 4) -> None:
+        with open(path, "w", encoding="utf-8") as handle:
+            for index in range(personas):
+                record = {
+                    "ID": f"persona-{index}",
+                    "Full_Session_Chain": [
+                        {
+                            "Session_ID": 0,
+                            "Date": "2022-01-03",
+                            "Session_Type": "initial_reveal",
+                            "Session_Dialogue": {
+                                "dialogue_turn_1": [
+                                    {"role": "user", "content": f"I am persona {index}."}
+                                ]
+                            },
+                            "Session_Questions": [
+                                {
+                                    "question_id": "Q_001",
+                                    "question": "Who is the user?",
+                                    "answer": f"persona {index}",
+                                    "conflict_type": "dynamic_conflict",
+                                    "ability_target": "track_state_over_time",
+                                    "difficulty": "easy",
+                                }
+                            ],
+                        }
+                    ],
+                }
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def test_indices_are_parsed_and_deduplicated(self):
+        from run_experiment import parse_persona_indices
+
+        self.assertEqual(parse_persona_indices("0,4,18,27,28"), [0, 4, 18, 27, 28])
+        self.assertEqual(parse_persona_indices("0-4,10,10"), [0, 1, 2, 3, 4, 10])
+        for bad in ("x", "5-2", "", "-1"):
+            with self.assertRaises(ValueError):
+                parse_persona_indices(bad)
+
+    def test_selection_keeps_dataset_order_and_checks_bounds(self):
+        from run_experiment import select_personas_by_index
+
+        personas = [SimpleNamespace(persona_id=f"p{index}") for index in range(5)]
+        selected, indices = select_personas_by_index(personas, [4, 0, 2])
+        self.assertEqual([persona.persona_id for persona in selected], ["p0", "p2", "p4"])
+        self.assertEqual(indices, [0, 2, 4])
+        with self.assertRaises(ValueError):
+            select_personas_by_index(personas, [9])
+
+    def test_main_runs_only_the_requested_personas(self):
+        from run_experiment import main
+
+        _patch_runtime(_FakeMemorySystem(), _FakeChatClient("ans"), _FakeChatClient())
+        saved = _save_env(
+            ollama_units.UNITS_ENV, "OLLAMA_BASE_URL", *ollama_units.ENDPOINT_ENV_KEYS
+        )
+        original_env_loader = runtime.load_env_file
+        runtime.load_env_file = lambda: None
+        for name in (ollama_units.UNITS_ENV, "OLLAMA_BASE_URL"):
+            os.environ.pop(name, None)
+        os.environ["OLLAMA_EMBED_ENDPOINT"] = "http://unit/api/embed"
+        os.environ["OLLAMA_LEGACY_EMBEDDINGS_ENDPOINT"] = "http://unit/api/embeddings"
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                dataset = Path(tmp) / "data.jsonl"
+                self._write_dataset(dataset)
+                run_dir = Path(tmp) / "shard"
+                with contextlib.redirect_stderr(io.StringIO()):
+                    code = main(
+                        [
+                            "--input",
+                            str(dataset),
+                            "--output-dir",
+                            str(run_dir),
+                            "--persona-indices",
+                            "0,2",
+                            "--no-progress",
+                        ]
+                    )
+                self.assertEqual(code, 0)
+                records = [
+                    json.loads(line)
+                    for line in (run_dir / "results.jsonl")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                    if line.strip()
+                ]
+                meta = json.loads((run_dir / "run_meta.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(
+                [record["Persona_ID"] for record in records], ["persona-0", "persona-2"]
+            )
+            self.assertEqual([record["Dataset_Index"] for record in records], [0, 2])
+            self.assertEqual(meta["Persona_Indices"], [0, 2])
+            self.assertIn("answer_model", meta["Models"])
+        finally:
+            runtime.load_env_file = original_env_loader
+            _restore_env(saved)
+
+    def test_indices_cannot_be_combined_with_the_contiguous_window(self):
+        from run_experiment import main
+
+        _patch_runtime(_FakeMemorySystem(), _FakeChatClient("ans"), _FakeChatClient())
+        saved = _save_env(
+            ollama_units.UNITS_ENV, "OLLAMA_BASE_URL", *ollama_units.ENDPOINT_ENV_KEYS
+        )
+        original_env_loader = runtime.load_env_file
+        runtime.load_env_file = lambda: None
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                dataset = Path(tmp) / "data.jsonl"
+                self._write_dataset(dataset)
+                with contextlib.redirect_stderr(io.StringIO()):
+                    code = main(
+                        [
+                            "--input",
+                            str(dataset),
+                            "--output-dir",
+                            str(Path(tmp) / "run"),
+                            "--persona-indices",
+                            "0",
+                            "--start-index",
+                            "1",
+                        ]
+                    )
+            self.assertEqual(code, 2)
+        finally:
+            runtime.load_env_file = original_env_loader
+            _restore_env(saved)
+
+    def test_shard_plan_is_deterministic_disjoint_and_complete(self):
+        from tools import shard_plan
+
+        personas = [
+            SimpleNamespace(sessions=[object()] * (51 + index % 4), question_count=100 + index)
+            for index in range(30)
+        ]
+        plan = shard_plan.build_plan(personas, shards=6, per_shard=5, seed=27)
+        again = shard_plan.build_plan(personas, shards=6, per_shard=5, seed=27)
+        different = shard_plan.build_plan(personas, shards=6, per_shard=5, seed=28)
+
+        self.assertEqual(plan, again)  # same seed -> same plan
+        self.assertNotEqual(
+            [shard["personas"] for shard in plan],
+            [shard["personas"] for shard in different],
+        )
+        covered = [index for shard in plan for index in shard["personas"]]
+        self.assertEqual(sorted(covered), list(range(30)))
+        self.assertEqual(len(covered), len(set(covered)))  # disjoint
+        self.assertTrue(all(len(shard["personas"]) == 5 for shard in plan))
+        # consecutive slices must not stay consecutive after the shuffle
+        self.assertNotEqual(plan[0]["personas"], list(range(5)))
+
+    def test_shard_plan_rejects_a_mismatched_split(self):
+        from tools import shard_plan
+
+        personas = [SimpleNamespace(sessions=[], question_count=0) for _ in range(30)]
+        with self.assertRaises(ValueError):
+            shard_plan.build_plan(personas, shards=6, per_shard=4, seed=1)
+
+    def test_dataset_digest_identifies_the_plan_input(self):
+        """Same dataset hash + same seed -> the same plan on another host."""
+        from tools import shard_plan
+
+        digest = shard_plan.dataset_digest(DATASET)
+        self.assertIsNotNone(digest)
+        self.assertEqual(len(digest), 64)
+        self.assertEqual(digest, shard_plan.dataset_digest(DATASET))
+        self.assertIsNone(shard_plan.dataset_digest(DATASET.parent / "does_not_exist.jsonl"))
+
+    def test_partial_merge_is_allowed_for_incremental_tables(self):
+        from tools.merge_shards import merge
+
+        persona = {"Persona_ID": "persona-0", "Sessions": [], "Memory_System": "m"}
+        with tempfile.TemporaryDirectory() as tmp:
+            shard = Path(tmp) / "shard_1"
+            shard.mkdir()
+            (shard / "results.jsonl").write_text(
+                json.dumps(persona) + "\n", encoding="utf-8"
+            )
+            (shard / "run_meta.json").write_text(json.dumps({"Wall_Clock_s": 10.0}), encoding="utf-8")
+            dataset = Path(tmp) / "data.jsonl"
+            with open(dataset, "w", encoding="utf-8") as handle:
+                for index in range(2):
+                    handle.write(
+                        json.dumps(
+                            {
+                                "ID": f"persona-{index}",
+                                "Full_Session_Chain": [
+                                    {"Session_ID": 0, "Date": "2022-01-01", "Session_Dialogue": {}}
+                                ],
+                            }
+                        )
+                        + "\n"
+                    )
+            strict, strict_status = merge([shard], dataset=dataset, allow_partial=False)
+            partial, partial_status = merge([shard], dataset=dataset, allow_partial=True)
+
+        self.assertEqual(strict_status, 1)
+        self.assertEqual(partial_status, 0)
+        self.assertTrue(partial["summary"]["Partial_Merge"])
+        self.assertEqual(partial["summary"]["Personas_Expected_From_Dataset"], 2)
+        self.assertEqual(partial["summary"]["Persona_Count"], 1)
+        self.assertEqual(strict["summary"]["Partial_Merge"], True)
+
+
+class ApiRateReportTests(unittest.TestCase):
+    """The quota check must read the real v4 API logs and project correctly."""
+
+    def _write_log(self, root: Path) -> Path:
+        run_dir = root / "shard_1"
+        store = run_dir / "Memory" / "retrival_mem_v4_p1_v1"
+        store.mkdir(parents=True)
+        rows = [
+            {
+                "provider": "dashscope_bailian",
+                "timestamp": "2026-01-01T00:00:00+00:00",
+                "success": True,
+                "token_usage": {"prompt_tokens": 1000, "completion_tokens": 100},
+                "module": "v4_memory_builder",
+            },
+            {
+                "provider": "dashscope_bailian",
+                "timestamp": "2026-01-01T00:01:00+00:00",
+                "success": False,
+                "token_usage": {"prompt_tokens": 2000, "completion_tokens": 0},
+                "module": "v4_semantic_reducer",
+            },
+            {
+                "provider": "ollama",
+                "timestamp": "2026-01-01T00:00:30+00:00",
+                "success": True,
+                "token_usage": {"prompt_tokens": 500, "completion_tokens": 50},
+                "module": "v4_window_planner",
+            },
+        ]
+        (store / "v4_memory_builder.jsonl").write_text(
+            "\n".join(json.dumps(row) for row in rows), encoding="utf-8"
+        )
+        return run_dir
+
+    def test_rates_are_computed_per_provider(self):
+        from tools import api_rate_report
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._write_log(Path(tmp))
+            stats = api_rate_report.collect([run_dir])
+
+        bailian = stats["dashscope_bailian"]
+        self.assertEqual(bailian.calls, 2)
+        self.assertEqual(bailian.failures, 1)
+        self.assertEqual(bailian.total_tokens, 3100)
+        self.assertAlmostEqual(bailian.minutes, 1.0, places=3)
+        self.assertAlmostEqual(bailian.per_minute(bailian.total_tokens), 3100.0, places=3)
+        self.assertEqual(bailian.modules["v4_semantic_reducer"], 1)
+        self.assertEqual(stats["ollama"].calls, 1)
+
+    def test_cli_reports_the_fraction_of_a_quota(self):
+        import contextlib
+        import io as _io
+
+        from tools import api_rate_report
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._write_log(Path(tmp))
+            stdout = _io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = api_rate_report.main(
+                    [
+                        "--run-dir",
+                        str(run_dir),
+                        "--provider",
+                        "dashscope_bailian",
+                        "--tpm",
+                        "1000000",
+                        "--rpm",
+                        "500",
+                        "--machines",
+                        "2",
+                    ]
+                )
+            text = stdout.getvalue()
+
+        self.assertEqual(code, 0)
+        self.assertIn("3,100 tokens/min", text)
+        self.assertIn("x2 machines", text)
+        self.assertIn("vs TPM 1,000,000", text)
+        self.assertIn("fits", text)
+
+
+class ShardChainTests(unittest.TestCase):
+    """Point 27 watchdog: chain shards, never fight over one store."""
+
+    def _run_dir(self, tmp: str, name: str = "shard_1") -> Path:
+        run_dir = Path(tmp) / name
+        run_dir.mkdir(parents=True)
+        return run_dir
+
+    def test_status_of_an_untouched_directory_is_idle(self):
+        from tools.run_shards_chain import shard_status
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(shard_status(self._run_dir(tmp)), "idle")
+
+    def test_status_is_waiting_while_the_first_run_is_in_flight(self):
+        from tools.run_shards_chain import shard_status
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run_dir(tmp)
+            (run_dir / "sessions.jsonl").write_text("{}\n", encoding="utf-8")
+            (run_dir / "results.jsonl").write_text("", encoding="utf-8")
+            self.assertEqual(shard_status(run_dir), "waiting")
+
+    def test_status_is_waiting_while_a_resume_is_in_flight(self):
+        """run_meta from the failed attempt is stale; sessions.jsonl grew again."""
+        from tools.run_shards_chain import shard_status
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run_dir(tmp)
+            sessions = run_dir / "sessions.jsonl"
+            meta = run_dir / "run_meta.json"
+            sessions.write_text("{}\n", encoding="utf-8")
+            meta.write_text(json.dumps({"Failed_Personas": ["p1"]}), encoding="utf-8")
+            now = time.time()
+            os.utime(meta, (now - 600, now - 600))
+            os.utime(sessions, (now, now))
+            self.assertEqual(shard_status(run_dir), "waiting")
+
+            os.utime(meta, (now + 600, now + 600))
+            self.assertEqual(shard_status(run_dir), "failed")
+
+    def test_status_is_done_only_without_failed_personas(self):
+        from tools.run_shards_chain import shard_status
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run_dir(tmp)
+            (run_dir / "run_meta.json").write_text(
+                json.dumps({"Failed_Personas": []}), encoding="utf-8"
+            )
+            self.assertEqual(shard_status(run_dir), "done")
+
+    def test_plan_shards_are_run_scored_and_merged_in_order(self):
+        from tools.run_shards_chain import Chain
+
+        plan = {
+            "plan": [
+                {"name": "shard_1", "personas": [0, 1]},
+                {"name": "shard_2", "personas": [2, 3]},
+            ]
+        }
+        calls: list[str] = []
+
+        def fake_step(command: list[str], log_path: Path) -> int:
+            script = next(Path(part).name for part in command if part.endswith(".py"))
+            calls.append(script)
+            if script == "run_experiment.py":
+                run_dir = Path(command[command.index("--output-dir") + 1])
+                run_dir.mkdir(parents=True, exist_ok=True)
+                (run_dir / "sessions.jsonl").write_text("{}\n", encoding="utf-8")
+                (run_dir / "run_meta.json").write_text(
+                    json.dumps({"Failed_Personas": []}), encoding="utf-8"
+                )
+            return 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            chain = Chain(
+                plan=plan,
+                runs_root=Path(tmp) / "runs",
+                config=Path("cfg.yaml"),
+                start_if_idle=True,
+                step_runner=fake_step,
+                sleep=lambda _seconds: None,
+                printer=lambda _line: None,
+            )
+            code = chain.run(plan["plan"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            calls,
+            [
+                "run_experiment.py",
+                "run_scoring.py",
+                "merge_shards.py",
+                "run_scoring.py",
+                "run_experiment.py",
+                "run_scoring.py",
+                "merge_shards.py",
+                "run_scoring.py",
+            ],
+        )
+
+    def test_chain_waits_for_a_running_shard_instead_of_starting_it(self):
+        from tools.run_shards_chain import Chain
+
+        plan = {"plan": [{"name": "shard_1", "personas": [0]}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            runs_root = Path(tmp) / "runs"
+            run_dir = runs_root / "shard_1"
+            run_dir.mkdir(parents=True)
+            (run_dir / "sessions.jsonl").write_text("{}\n", encoding="utf-8")
+
+            def fake_sleep(_seconds: float) -> None:
+                # the other terminal finishes while we wait
+                (run_dir / "run_meta.json").write_text(
+                    json.dumps({"Failed_Personas": []}), encoding="utf-8"
+                )
+                os.utime(run_dir / "run_meta.json", None)
+                future = time.time() + 600
+                os.utime(run_dir / "run_meta.json", (future, future))
+
+            def fake_step(command: list[str], log_path: Path) -> int:
+                return 0
+
+            chain = Chain(
+                plan=plan,
+                runs_root=runs_root,
+                config=Path("cfg.yaml"),
+                step_runner=fake_step,
+                sleep=fake_sleep,
+                printer=lambda _line: None,
+            )
+            code = chain.run(plan["plan"])
+
+        self.assertEqual(code, 0)
+
+    def test_each_shard_can_get_its_own_ollama_container(self):
+        from tools.run_shards_chain import Chain
+
+        plan = {
+            "plan": [
+                {"name": "shard_1", "personas": [0], "_order": 0},
+                {"name": "shard_2", "personas": [1], "_order": 1},
+                {"name": "shard_3", "personas": [2], "_order": 2},
+                {"name": "shard_4", "personas": [3], "_order": 3},
+            ]
+        }
+        chain = Chain(
+            plan=plan,
+            runs_root=Path("runs"),
+            config=Path("cfg.yaml"),
+            units_map={"shard_1": "http://gpu:41135", "shard_3": "http://gpu:41136"},
+            units_pool=["http://gpu:41133", "http://gpu:41134"],
+            printer=lambda _line: None,
+        )
+        self.assertEqual(chain.unit_for(plan["plan"][0], 0), "http://gpu:41135")
+        self.assertEqual(chain.unit_for(plan["plan"][2], 2), "http://gpu:41136")
+        # no explicit entry -> round robin over --ollama-units
+        self.assertEqual(chain.unit_for(plan["plan"][1], 1), "http://gpu:41134")
+        self.assertEqual(chain.unit_for(plan["plan"][3], 3), "http://gpu:41134")
+        command = chain.run_command(plan["plan"][0])
+        self.assertIn("--ollama-units", command)
+        self.assertEqual(command[command.index("--ollama-units") + 1], "http://gpu:41135")
+
+    def test_parallel_mode_runs_every_shard_and_merges_under_a_lock(self):
+        from tools.run_shards_chain import Chain
+
+        plan = {
+            "plan": [
+                {"name": f"shard_{index}", "personas": [index]} for index in (1, 2, 3)
+            ]
+        }
+        calls: list[str] = []
+        lock = threading.Lock()
+
+        def fake_step(command: list[str], log_path: Path) -> int:
+            script = next(Path(part).name for part in command if part.endswith(".py"))
+            with lock:
+                calls.append(script)
+            if script == "run_experiment.py":
+                run_dir = Path(command[command.index("--output-dir") + 1])
+                run_dir.mkdir(parents=True, exist_ok=True)
+                (run_dir / "sessions.jsonl").write_text("{}\n", encoding="utf-8")
+                (run_dir / "run_meta.json").write_text(
+                    json.dumps({"Failed_Personas": []}), encoding="utf-8"
+                )
+            return 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            chain = Chain(
+                plan=plan,
+                runs_root=Path(tmp) / "runs",
+                config=Path("cfg.yaml"),
+                start_if_idle=True,
+                parallel=3,
+                step_runner=fake_step,
+                sleep=lambda _seconds: None,
+                printer=lambda _line: None,
+            )
+            code = chain.run(plan["plan"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(calls.count("run_experiment.py"), 3)
+        self.assertEqual(calls.count("merge_shards.py"), 3)  # once per finished shard
+        self.assertEqual(calls.count("run_scoring.py"), 6)  # per shard + per merged
+
+
+class ResumeModelGuardTests(unittest.TestCase):
+    """--resume must not continue a store built by different models."""
+
+    def _prepare(self, tmp: str, recorded_models) -> tuple[Path, Path]:
+        root = Path(tmp)
+        dataset = root / "data.jsonl"
+        dataset.write_text(
+            json.dumps(
+                {
+                    "ID": "persona-0",
+                    "Full_Session_Chain": [
+                        {
+                            "Session_ID": 0,
+                            "Date": "2022-01-03",
+                            "Session_Type": "initial_reveal",
+                            "Session_Dialogue": {
+                                "dialogue_turn_1": [{"role": "user", "content": "hi"}]
+                            },
+                            "Session_Questions": [],
+                        }
+                    ],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        run_dir = root / "run"
+        run_dir.mkdir()
+        (run_dir / "sessions.jsonl").write_text(
+            json.dumps(
+                {
+                    "Persona_ID": "persona-0",
+                    "Session_ID": 0,
+                    "Date": "2022-01-03",
+                    "Questions": [],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        meta = {"Persona_Unit_Assignments": {"persona-0": None}}
+        if recorded_models is not None:
+            meta["Models"] = recorded_models
+        (run_dir / "run_meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        return dataset, run_dir
+
+    def _run_resume(self, dataset: Path, run_dir: Path, extra=None):
+        from run_experiment import main
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main(
+                [
+                    "--input",
+                    str(dataset),
+                    "--output-dir",
+                    str(run_dir),
+                    "--resume",
+                    "--no-progress",
+                    *(extra or []),
+                ]
+            )
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def setUp(self):
+        _patch_runtime(_FakeMemorySystem(), _FakeChatClient("ans"), _FakeChatClient())
+        self._saved = _save_env(
+            ollama_units.UNITS_ENV, "OLLAMA_BASE_URL", *ollama_units.ENDPOINT_ENV_KEYS
+        )
+        self._loader = runtime.load_env_file
+        runtime.load_env_file = lambda: None
+        for name in (ollama_units.UNITS_ENV, "OLLAMA_BASE_URL"):
+            os.environ.pop(name, None)
+        os.environ["OLLAMA_EMBED_ENDPOINT"] = "http://unit/api/embed"
+        os.environ["OLLAMA_LEGACY_EMBEDDINGS_ENDPOINT"] = "http://unit/api/embeddings"
+
+    def tearDown(self):
+        runtime.load_env_file = self._loader
+        _restore_env(self._saved)
+
+    def test_resume_continues_when_the_models_are_unchanged(self):
+        # Must match exactly what ``_patch_runtime`` reports for the fake config.
+        recorded = {
+            "embedding": "ollama/fake-embed",
+            "answer_model": "fake-answer",
+            "judge_model": "fake-judge",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset, run_dir = self._prepare(tmp, recorded)
+            code, _stdout, stderr = self._run_resume(dataset, run_dir)
+        self.assertEqual(code, 0, stderr)
+
+    def test_resume_refuses_a_changed_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset, run_dir = self._prepare(tmp, {"embedding": "ollama/qwen3-embedding"})
+            code, _stdout, stderr = self._run_resume(dataset, run_dir)
+            allowed_code, _stdout2, allowed_stderr = self._run_resume(
+                dataset, run_dir, ["--allow-model-change"]
+            )
+
+        self.assertEqual(code, 2)
+        self.assertIn("built with different models", stderr)
+        self.assertIn("ollama/qwen3-embedding -> ollama/fake-embed", stderr)
+        self.assertEqual(allowed_code, 0, allowed_stderr)
+        self.assertIn("--allow-model-change", allowed_stderr)
+
+    def test_resume_of_an_older_run_without_a_fingerprint_is_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset, run_dir = self._prepare(tmp, None)
+            code, stdout, stderr = self._run_resume(dataset, run_dir)
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("no model fingerprint", stdout)
+
+
+class BailianConfigTests(unittest.TestCase):
+    """The GLM roles must come from Bailian, the protocol judge stays put."""
+
+    def test_bailian_config_wires_glm_to_dashscope(self):
+        import importlib
+
+        from run_experiment import model_summary
+
+        # Other tests stub ``runtime`` globally; reload so this test reads the
+        # real loader (the same pattern RunnerMainWiringTests uses).
+        importlib.reload(runtime)
+        config_path = EXPERIMENT_DIR / "configs" / "eval_large_bailian.yaml"
+        config = runtime.load_memory_config(config_path)
+        models = model_summary(config)
+
+        self.assertEqual(models["memory_builder"], "dashscope_bailian/glm-5.1")
+        self.assertEqual(models["adjudication_model"], "dashscope_bailian/glm-5.1")
+        self.assertEqual(models["answer_model"], "dashscope_bailian/glm-5.1")
+        self.assertEqual(models["judge_model"], "openrouter/openai/gpt-4o-mini")
+        self.assertEqual(models["embedding"], "ollama/qwen3-embedding")
+
+        runner_env = runtime.required_env_names(config, runtime.RUNNER_ROLES)
+        self.assertIn("DASHSCOPE_API_KEY", runner_env)
+        self.assertIn("DASHSCOPE_CHAT_COMPLETIONS_ENDPOINT", runner_env)
+        self.assertNotIn("OPENROUTER_API_KEY", runner_env)
+        self.assertEqual(
+            runtime.required_env_names(config, runtime.SCORING_ROLES),
+            ["OPENROUTER_API_KEY", "OPENROUTER_CHAT_COMPLETIONS_ENDPOINT"],
+        )
+
+    def test_all_bailian_config_removes_the_ollama_dependency(self):
+        """A cloud host with no campus network can run this config end to end."""
+        import importlib
+
+        from run_experiment import model_summary
+
+        importlib.reload(runtime)
+        config = runtime.load_memory_config(
+            EXPERIMENT_DIR / "configs" / "eval_large_bailian_all.yaml"
+        )
+        models = model_summary(config)
+
+        self.assertEqual(models["embedding"], "dashscope_bailian/text-embedding-v4")
+        self.assertEqual(models["memory_builder"], "dashscope_bailian/glm-5.1")
+        self.assertEqual(models["controller"], "dashscope_bailian/qwen3.5-flash")
+        self.assertEqual(models["window_planner"], "dashscope_bailian/qwen3.5-flash")
+
+        runner_env = runtime.required_env_names(config, runtime.RUNNER_ROLES)
+        self.assertIn("DASHSCOPE_API_KEY", runner_env)
+        self.assertIn("DASHSCOPE_CHAT_COMPLETIONS_ENDPOINT", runner_env)
+        self.assertIn("DASHSCOPE_EMBEDDINGS_ENDPOINT", runner_env)
+        self.assertNotIn("OLLAMA_CHAT_ENDPOINT", runner_env)
+        self.assertNotIn("OLLAMA_EMBED_ENDPOINT", runner_env)
+
+
+class RunSummaryTests(unittest.TestCase):
+    """The batch launcher must not carry printf-style `%` into cmd.exe."""
+
+    def test_summary_lines_report_clock_workers_and_failures(self):
+        from tools import run_summary
+
+        lines = run_summary.summarize(
+            {
+                "Wall_Clock_s": 2050.6,
+                "Persona_Workers": 4,
+                "Answer_Workers": 4,
+                "Failed_Personas": [],
+            }
+        )
+        self.assertIn("2050.6 s (34.2 min)", lines[0])
+        self.assertIn("4 persona / 4 answer", lines[1])
+        self.assertIn("none", lines[2])
+
+    def test_summary_tool_reads_a_run_directory(self):
+        from tools import run_summary
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            (run_dir / "run_meta.json").write_text(
+                json.dumps(
+                    {
+                        "Wall_Clock_s": 60.0,
+                        "Persona_Workers": 2,
+                        "Answer_Workers": 1,
+                        "Failed_Personas": ["persona-x"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(run_summary.main(["--run-dir", str(run_dir)]), 0)
+            self.assertEqual(run_summary.main(["--run-dir", str(run_dir / "missing")]), 1)
+
+    def test_the_batch_launcher_has_no_bare_percent_signs(self):
+        """A bare `%` is expanded by cmd.exe before Python sees it.
+
+        That is what turned the run summary of ``run_scale1h.bat`` into a
+        ``SyntaxError`` on 2026-09-20.
+        """
+        import re
+
+        launcher = Path(__file__).resolve().parents[2] / "run_scale1h.bat"
+        if not launcher.is_file():
+            self.skipTest("launcher not present")
+        assertable = re.compile(r"%[A-Za-z_][A-Za-z0-9_]*%|%%|%~[a-zA-Z]*[0-9*]|%[0-9*]")
+        for number, line in enumerate(
+            launcher.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            residual = assertable.sub("", line)
+            self.assertNotIn(
+                "%",
+                residual,
+                f"run_scale1h.bat:{number} contains a bare percent sign: {line.strip()}",
+            )
+
+
+class ReproToolTests(unittest.TestCase):
+    """The bug-reproduction tool must keep reproducing the upstream failure."""
+
+    def test_repro_tool_reproduces_the_exception(self):
+        tool = EXPERIMENT_DIR / "tools" / "repro_stale_checkpoint_bug.py"
+        candidates = list(
+            (EXPERIMENT_DIR / "runs").glob(
+                "*/Memory/retrival_mem_v4_90e98aa7*/memory.sqlite3"
+            )
+        )
+        if not candidates:
+            self.skipTest("no crashed persona store in this workspace")
+        result = subprocess.run(
+            [sys.executable, str(tool)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=300,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        self.assertIn("REPRODUCED", result.stdout)
+        self.assertIn("reinforce references unknown fact key", result.stdout)
+        self.assertIn("conversation:{len(turns)}", result.stdout)
+        self.assertIn("collision", result.stdout.lower())
+
+
+class RunProgressIntegrationTests(unittest.TestCase):
+    """A run must show progress without anyone opening sessions.jsonl."""
+
+    def _write_dataset(self, path: Path) -> None:
+        record = {
+            "ID": "persona-progress",
+            "Full_Session_Chain": [
+                {
+                    "Session_ID": 0,
+                    "Date": "2022-01-03",
+                    "Session_Type": "initial_reveal",
+                    "Session_Dialogue": {
+                        "dialogue_turn_1": [{"role": "user", "content": "I live in Darwin."}]
+                    },
+                    "Session_Questions": [],
+                },
+                {
+                    "Session_ID": 1,
+                    "Date": "2022-02-03",
+                    "Session_Type": "update",
+                    "Session_Dialogue": {
+                        "dialogue_turn_1": [{"role": "user", "content": "I moved to Melbourne."}]
+                    },
+                    "Session_Questions": [
+                        {
+                            "question_id": "Q_001",
+                            "question": "Where does the user live?",
+                            "answer": "Melbourne, Australia.",
+                            "conflict_type": "dynamic_conflict",
+                            "ability_target": "track_state_over_time",
+                            "difficulty": "easy",
+                        }
+                    ],
+                },
+            ],
+        }
+        path.write_text(json.dumps(record, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    def _run(self, tmp: str, extra: list[str]) -> tuple[int, str]:
+        from run_experiment import main
+
+        dataset = Path(tmp) / "data.jsonl"
+        self._write_dataset(dataset)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = main(
+                [
+                    "--input",
+                    str(dataset),
+                    "--output-dir",
+                    str(Path(tmp) / "run"),
+                    "--max-sessions",
+                    "2",
+                    *extra,
+                ]
+            )
+        return code, stderr.getvalue()
+
+    def setUp(self):
+        self._patch = _patch_runtime(
+            _FakeMemorySystem(), _FakeChatClient("answer"), _FakeChatClient()
+        )
+        self._saved_env = _save_env(
+            ollama_units.UNITS_ENV,
+            "OLLAMA_BASE_URL",
+            *ollama_units.ENDPOINT_ENV_KEYS,
+        )
+        self._original_env_loader = runtime.load_env_file
+        runtime.load_env_file = lambda: None
+        for name in (ollama_units.UNITS_ENV, "OLLAMA_BASE_URL"):
+            os.environ.pop(name, None)
+        # The fake config only declares an Ollama embedding role, so the
+        # credential preflight looks for these two endpoint variables.
+        os.environ["OLLAMA_EMBED_ENDPOINT"] = "http://unit/api/embed"
+        os.environ["OLLAMA_LEGACY_EMBEDDINGS_ENDPOINT"] = "http://unit/api/embeddings"
+
+    def tearDown(self):
+        runtime.load_env_file = self._original_env_loader
+        _restore_env(self._saved_env)
+
+    def test_main_prints_progress_without_opening_sessions_jsonl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, stderr = self._run(tmp, [])
+        self.assertEqual(code, 0)
+        self.assertIn("[progress]", stderr)
+        self.assertIn("sessions", stderr)
+        self.assertIn("questions 1/1", stderr)
+        self.assertIn("2/2 sessions", stderr)
+
+    def test_no_progress_silences_the_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, stderr = self._run(tmp, ["--no-progress"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("[progress]", stderr)
 
 
 if __name__ == "__main__":

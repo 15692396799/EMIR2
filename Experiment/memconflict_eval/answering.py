@@ -32,10 +32,10 @@ class MemConflictAnswerer:
     """Wraps the Retrival-Mem answer model with the MemConflict prompt."""
 
     def __init__(self, config: Any = None) -> None:
-        client = runtime.import_retrival_mem()
-        self._make_chat_client = client.make_chat_client
         self.config = config if config is not None else runtime.load_memory_config()
-        self.client = client.make_chat_client(self.config.answer_model)
+        # runtime.build_chat_client handles the azure provider; everything else
+        # is the unmodified Retrival-Mem factory.
+        self.client = runtime.build_chat_client(self.config.answer_model)
 
     def answer(
         self,

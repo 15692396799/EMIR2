@@ -26,6 +26,12 @@ DEFAULT_MEMCONFLICT_ROOT = PROJECT_ROOT / "MemConflict"
 
 MEMORY_SYSTEM_NAME = "retrival_mem_v4"
 
+#: P1-2 concurrency overrides. One persona worker multiplies whatever the
+#: config asks for, so the runner exposes these instead of editing YAML per
+#: worker count.
+EXTRACTION_WORKERS_ENV = "MEMCONFLICT_EXTRACTION_WORKERS"
+ENTITY_JUDGE_WORKERS_ENV = "MEMCONFLICT_ENTITY_JUDGE_WORKERS"
+
 
 class DependencyError(RuntimeError):
     """Raised when an upstream checkout or credential is missing."""
@@ -102,6 +108,30 @@ def import_retrival_mem(root: Path | None = None):
     )
 
 
+def build_chat_client(model_config: Any):
+    """Build the chat client for a role, honouring the ``azure`` provider.
+
+    Everything else goes through the unmodified Retrival-Mem factory; Azure
+    needs its own client because it authenticates with ``api-key`` and puts the
+    deployment in the path (see ``azure_client``).
+
+    The result is wrapped in the retrying client: OpenRouter's upstreams flip
+    between reachable and geo-filtered (and the local proxy drops connections),
+    and both are two-second problems that should not cost a persona's judging
+    pass. ``MEMCONFLICT_CHAT_RETRIES=1`` restores the raw client.
+    """
+    from .retrying import wrap_retrying
+
+    provider = str(getattr(model_config, "provider", "") or "").lower()
+    if provider == "azure":
+        from .azure_client import build_azure_chat_client
+
+        client = build_azure_chat_client(model_config)
+    else:
+        client = import_retrival_mem().make_chat_client(model_config)
+    return wrap_retrying(client, prefix="MEMCONFLICT_CHAT")
+
+
 def load_memory_config(config_path: Path | None = None):
     """Load the Retrival-Mem config, reading ``Retrival-Mem/.env`` for secrets.
 
@@ -118,7 +148,47 @@ def load_memory_config(config_path: Path | None = None):
     env_path = default_env_path()
     config = runtime.load_config(path, env_path=env_path)
     ollama_units.apply_active_unit()
+    apply_concurrency_overrides(config)
     return config
+
+
+def apply_concurrency_overrides(config) -> dict[str, int]:
+    """Apply the per-worker concurrency limits (P1-2) to a loaded config.
+
+    ``--persona-workers N`` multiplies every internal thread pool by N, so the
+    runner passes these limits through the environment instead of requiring a
+    hand-edited YAML per worker count. Only the values that are actually set
+    are touched.
+    """
+    applied: dict[str, int] = {}
+    memory = getattr(config, "memory", None)
+    if memory is None:
+        return applied
+
+    def positive(name: str) -> int | None:
+        raw = os.getenv(name)
+        if raw is None or not str(raw).strip():
+            return None
+        try:
+            value = int(str(raw).strip())
+        except ValueError:
+            return None
+        return value if value > 0 else None
+
+    extraction = positive(EXTRACTION_WORKERS_ENV)
+    if extraction is not None:
+        memory.memory_extraction_workers = extraction
+        applied["memory_extraction_workers"] = extraction
+
+    entity_judge = positive(ENTITY_JUDGE_WORKERS_ENV)
+    if entity_judge is not None:
+        backends = getattr(memory, "backends", None)
+        if isinstance(backends, dict):
+            backend = backends.setdefault("v4", {})
+            if isinstance(backend, dict):
+                backend["entity_judge_workers"] = entity_judge
+                applied["entity_judge_workers"] = entity_judge
+    return applied
 
 
 def load_env_file() -> Path:
@@ -189,6 +259,24 @@ def required_env_names(config, roles: tuple[str, ...] = RUNNER_ROLES) -> list[st
                 required.add(f"{prefix}_EMBEDDINGS_ENDPOINT")
             else:
                 required.add(f"{prefix}_CHAT_COMPLETIONS_ENDPOINT")
+            continue
+        if provider == "azure":
+            required.add("AZURE_API_KEY")
+            required.add("AZURE_OPENAI_ENDPOINT")
+            continue
+        # Any other OpenAI-compatible provider (modelscope_openai_compatible,
+        # vllm_openai_compatible, ...): trust the env names the config itself
+        # declares instead of guessing a prefix, so alternative channels
+        # (Qianfan, Zhipu, an internal gateway) preflight correctly.
+        for attribute in (
+            "api_key_env",
+            "chat_completions_endpoint_env",
+            "embeddings_endpoint_env",
+            "base_url_env",
+        ):
+            name = getattr(model, attribute, None)
+            if name:
+                required.add(str(name))
     return sorted(required)
 
 

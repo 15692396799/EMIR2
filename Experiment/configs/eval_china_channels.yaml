@@ -1,0 +1,117 @@
+# Same experiment as eval_large.yaml, but every cloud role leaves OpenRouter:
+#
+#   memory_builder / adjudication_model / answer_model -> Baidu Qianfan
+#       (or Zhipu BigModel -- both are OpenAI-compatible with Bearer auth)
+#   judge_model -> Azure OpenAI (api-key header + deployment path)
+#
+# Why: OpenRouter geo-gates this machine ("This model is not available in your
+# region"), first for openai/gpt-4o-mini and intermittently for z-ai/glm-5.1.
+# A vendor-direct endpoint is not behind that gate.
+#
+# TODO fill these in Experiment/.env:
+#   QIANFAN_API_KEY / QIANFAN_CHAT_COMPLETIONS_ENDPOINT
+#   AZURE_API_KEY / AZURE_OPENAI_ENDPOINT / AZURE_OPENAI_DEPLOYMENT
+#   AZURE_OPENAI_API_VERSION (default 2024-10-21)
+#
+# Two things to check with the real keys before a long run:
+#   * the model id the channel uses for GLM (Qianfan renames third-party models,
+#     e.g. an "ernie"/"deepseek" style id; Zhipu's own platform uses glm-4.6/
+#     glm-4.5 style ids). If GLM is not hosted there, point &large_chat at the
+#     provider's strongest model and record the substitution in run_meta.
+#   * that the endpoint tolerates the extra `enable_thinking` /
+#     `chat_template_kwargs` fields the OpenAI-compatible client sends; if it
+#     rejects them, the provider must be `azure`-style or an adapter is needed.
+
+experiment:
+  track: evaluation
+models:
+  embedding:
+    provider: ollama
+    model: qwen3-embedding
+    base_url_env: OLLAMA_BASE_URL
+    timeout: 600
+  # `modelscope_openai_compatible` is upstream's generic Bearer-auth
+  # OpenAI-compatible provider: it takes the endpoint and key from whatever env
+  # names the config declares, which is exactly what a vendor direct channel is.
+  memory_builder: &china_chat
+    provider: modelscope_openai_compatible
+    model: glm-5.1
+    api_key_env: QIANFAN_API_KEY
+    chat_completions_endpoint_env: QIANFAN_CHAT_COMPLETIONS_ENDPOINT
+    temperature: 0.0
+    timeout: 300
+    extra_body:
+      max_tokens: 32768
+  adjudication_model: *china_chat
+  answer_model: *china_chat
+  judge_model:
+    provider: azure
+    model: gpt-4o-mini
+    temperature: 0.0
+    timeout: 120
+    # deployment/api_version come from AZURE_OPENAI_* in .env; the client sends
+    # the api-key header and the /openai/deployments/... chat completions path.
+    extra:
+      max_tokens: 512
+  window_planner: &control_chat
+    provider: ollama
+    model: qwen3.5:latest
+    base_url_env: OLLAMA_BASE_URL
+    temperature: 0.0
+    timeout: 3600
+  entity_judge: *control_chat
+  controller: *control_chat
+  decomposition_gate: *control_chat
+  slm: *control_chat
+memory:
+  backend: v4
+  memory_extraction_batch_turns: 64
+  memory_extraction_workers: 8
+  llm_max_retries: 2
+  llm_retry_backoff_seconds: 1.0
+  include_retrieval_trace_in_answer_prompt: false
+  answer_context_mode: content aware
+  backends:
+    v4:
+      database_path: data/memconflict_eval.sqlite3
+      faiss_path: data/memconflict_eval_faiss
+      memory_builder_model: memory_builder
+      semantic_state_model: null
+      embedding_model: embedding
+      entity_judge_batch_size: 8
+      entity_judge_workers: 2
+      entity_auto_merge_policy: conservative
+      prompt_output_tokens:
+        memory_builder: 32768
+        semantic_reducer: 8192
+        window_boundary: 512
+        entity_judge: 2048
+        cross_window_adjudication: 16384
+      window_planner:
+        mode: model
+        token_encoding: cl100k_base
+        min_builder_input_tokens: 2048
+        target_builder_input_tokens: 12000
+        max_builder_input_tokens: 30000
+        max_window_turns: 0
+        max_window_atoms: 64
+retrieval:
+  strategy: multi_round
+  controller_profile: teacher
+  strategies:
+    multi_round:
+      controller_model: controller
+      controller_max_retries: 2
+      rank_fusion_constant: 60
+      model_evidence_filter_enabled: false
+evaluation:
+  benchmarks:
+  - locomo
+  benchmark_dir: benchmark
+  output_dir: runs
+  locomo:
+    answer_workers: 4
+    answer_chunk_size: 1
+    judge_workers: 4
+    answer_max_retries: 2
+    use_llm_judge: true

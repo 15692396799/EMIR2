@@ -2946,11 +2946,17 @@ class StaleCheckpointGuardTests(unittest.TestCase):
 
     def setUp(self):
         self._saved_guard = os.environ.pop("MEMCONFLICT_CHECKPOINT_GUARD", None)
+        self._saved_retries = os.environ.pop(
+            "MEMCONFLICT_CHECKPOINT_RETRIES", None
+        )
 
     def tearDown(self):
         os.environ.pop("MEMCONFLICT_CHECKPOINT_GUARD", None)
+        os.environ.pop("MEMCONFLICT_CHECKPOINT_RETRIES", None)
         if self._saved_guard is not None:
             os.environ["MEMCONFLICT_CHECKPOINT_GUARD"] = self._saved_guard
+        if self._saved_retries is not None:
+            os.environ["MEMCONFLICT_CHECKPOINT_RETRIES"] = self._saved_retries
 
     def test_checkpoints_from_an_older_scope_revision_are_dropped(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3097,6 +3103,83 @@ class StaleCheckpointGuardTests(unittest.TestCase):
                 memory.ingest_session(session)
 
         self.assertEqual(memory.system.calls, 1)
+
+    def test_the_retry_budget_re_samples_the_answer(self):
+        """MEMCONFLICT_CHECKPOINT_RETRIES decides how often the answer is redrawn."""
+
+        class AlwaysStaleSystem:
+            def __init__(self):
+                self.calls = 0
+
+            def ingest_conversation(self, namespace, conversation, metadata=None, **_k):
+                self.calls += 1
+                raise SemanticValidationError("reinforce references unknown fact key")
+
+            def is_namespace_ready(self, namespace):
+                return True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._store(
+                tmp, revision=6, rows=[("stale", 5, "semantic_update", "succeeded")]
+            )
+            memory = self._memory(tmp)
+            memory.system = AlwaysStaleSystem()
+            os.environ["MEMCONFLICT_CHECKPOINT_RETRIES"] = "2"
+
+            with self.assertRaises(SemanticValidationError):
+                memory.ingest_session(self._session())
+
+        # One attempt plus two retries, then the budget is spent.
+        self.assertEqual(memory.system.calls, 3)
+
+    def test_zero_retries_invalidate_without_re_sampling(self):
+        class AlwaysStaleSystem:
+            def __init__(self):
+                self.calls = 0
+
+            def ingest_conversation(self, namespace, conversation, metadata=None, **_k):
+                self.calls += 1
+                raise SemanticValidationError("reinforce references unknown fact key")
+
+            def is_namespace_ready(self, namespace):
+                return True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._store(
+                tmp, revision=6, rows=[("stale", 5, "semantic_update", "succeeded")]
+            )
+            memory = self._memory(tmp)
+            memory.system = AlwaysStaleSystem()
+            os.environ["MEMCONFLICT_CHECKPOINT_RETRIES"] = "0"
+
+            with self.assertRaises(SemanticValidationError):
+                memory.ingest_session(self._session())
+            statuses = self._statuses(db)
+
+        self.assertEqual(memory.system.calls, 1)
+        # The guard still marks the cache entry failed, so a --resume recomputes.
+        self.assertEqual(statuses["stale"], "failed")
+
+    def test_the_retry_budget_is_read_from_the_environment(self):
+        self.assertEqual(MemConflictMemory.checkpoint_retries(), 3)
+        os.environ["MEMCONFLICT_CHECKPOINT_RETRIES"] = "2"
+        self.assertEqual(MemConflictMemory.checkpoint_retries(), 2)
+        os.environ["MEMCONFLICT_CHECKPOINT_RETRIES"] = "99"
+        self.assertEqual(MemConflictMemory.checkpoint_retries(), 10)
+        os.environ["MEMCONFLICT_CHECKPOINT_RETRIES"] = "-4"
+        self.assertEqual(MemConflictMemory.checkpoint_retries(), 0)
+        os.environ["MEMCONFLICT_CHECKPOINT_RETRIES"] = "many"
+        self.assertEqual(MemConflictMemory.checkpoint_retries(), 3)
+
+    @staticmethod
+    def _session(session_id: int = 7):
+        return SimpleNamespace(
+            session_id=session_id,
+            date="2022-03-09",
+            session_type="chitchat",
+            dialogue=("a", "b"),
+            to_memory_session=lambda: {"session_id": str(session_id), "turns": []},
+        )
 
 
 class PersonaShardTests(unittest.TestCase):

@@ -31,6 +31,7 @@
 31. debug：模型在adjudication时把方向写反；修改了Retrieval Mem
 32. ollama容器多开；我们计划再在device2,3上开新的ollama容器ollama021-3-1和ollama021-3-2
 33. 记忆构建和打分模型调换；打分模型更换成gpt-5-mini；记忆构建模型更换成gpt-4o-mini
+34. debug：陈旧缓存保护警告；提高重试次数
 
 ```
 

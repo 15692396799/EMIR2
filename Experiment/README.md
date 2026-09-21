@@ -329,6 +329,36 @@ checkout:
 * `MEMCONFLICT_CHECKPOINT_GUARD=0` turns the guard off (the raw upstream
   behaviour, useful when comparing against an unguarded run).
 
+### The semantic reducer ref guard
+
+The reducer prompt hands the model two ref lists: `event.trigger_event_ref` (the
+event the claim came from, copied out of the extraction answer) and
+`local_event_refs` (the events extracted in *this* window). Upstream validates
+the answer against the second list only, so a claim whose trigger was extracted
+in another window advertises a ref the answer may not cite; a model that cites
+the ref the prompt itself handed it is rejected with
+`semantic operation references evidence outside supplied local event refs`.
+Because the reducer role runs at `temperature: 0.0`, the retry produces the same
+answer: the checkpoint guard invalidates the stage's six cached units, re-runs
+the session, and the persona dies when the budget is spent -- and session 0 of a
+fresh run shows it immediately, because nothing stale is involved, which is what
+makes that `[warn]` look wrong there.
+
+Measured on 2026-09-21 over the API logs of every finished store: 47 of 3,912
+reducer answers cited a ref outside `local_event_refs`; shard_1 session 0 of
+`a7850e51` is the smallest example (`trigger_event_ref: turn_17`, while
+`local_event_refs` lists `turn_1, turn_3, turn_5, turn_7, turn_9, turn_11,
+turn_13, turn_18, turn_40, turn_80`). `_apply_reducer_update` resolves every
+cited ref through `event_refs` and silently drops the ones that miss, so an
+unresolvable ref cannot contribute anything to memory in the first place.
+
+`memconflict_eval/reducer_guard.py` therefore drops exactly those refs: the
+request stops advertising an unresolvable trigger, and
+`evidence_event_refs` that cannot resolve are removed from the answer (the fact
+is still recorded, with the refs that do resolve). Extraction, adjudication,
+planner and entity-judge calls are never touched, a legal answer is returned
+byte for byte, and `MEMCONFLICT_REDUCER_GUARD=0` restores upstream behaviour.
+
 ### Interrupted runs: resume, and never lose finished work
 
 * `results.jsonl` is written the moment a persona finishes (P0-1). The dataset

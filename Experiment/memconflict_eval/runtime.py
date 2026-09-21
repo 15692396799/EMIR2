@@ -98,10 +98,13 @@ def import_retrival_mem(root: Path | None = None):
     )
 
     from .openrouter_reasoning import install_reasoning_guard
+    from .reducer_guard import install_reducer_guard
 
-    # The checkout stays read-only, so a request shape the provider rejects is
-    # repaired here instead (see the module docstring of the guard).
+    # The checkout stays read-only, so a request shape the provider rejects and a
+    # prompt/validator mismatch inside the reducer are repaired here instead (see
+    # the module docstrings of the two guards).
     install_reasoning_guard()
+    install_reducer_guard()
 
     return SimpleNamespace(
         MemorySystem=MemorySystem,
